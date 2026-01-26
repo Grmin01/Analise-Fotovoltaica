@@ -1,3 +1,1427 @@
+# -*- coding: utf-8 -*-
+r"""
+pipeline_sam_unificado_v4_report.py
+===============================================================
+Pipeline único (morph + valida + roda SAM + consolida + analisa + relatório)
+
+NOVO (v4):
+- Gera um RELATÓRIO GERAL ao final (Markdown), avaliando cada etapa:
+  1) Pré-check (ERA5 base, NEX cobertura amostral, PySAM)
+  2) Climatologia (cache usado/rebuild, variáveis disponíveis)
+  3) Morph/validação (CSV 8760, colunas, NaN, estatísticas rápidas)
+  4) Execução SAM (sucessos/erros, tempos, outliers simples)
+  5) Consolidação (OK/ERRO/SEM_LOG, cobertura por SSP/ano)
+  6) Análise (arquivos gerados, gráficos, tendências)
+- Relatório salvo em OUT_ROOT como:
+    relatorio_pipeline_{MODEL}_{YYYYMMDD_HHMMSS}.md
+
+Exemplos:
+  python pipeline_sam_unificado_v4_report.py --mode test
+  python pipeline_sam_unificado_v4_report.py --mode full
+  python pipeline_sam_unificado_v4_report.py --mode full --years 2020:2025 --scenarios ssp245
+  python pipeline_sam_unificado_v4_report.py --mode full --force
+  python pipeline_sam_unificado_v4_report.py --mode analyze
+
+Requisitos:
+  pip install pandas numpy xarray tqdm matplotlib netCDF4 NREL-PySAM
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import argparse
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except Exception:
+    HAS_TQDM = False
+
+# ========================= CONFIG (AJUSTE AQUI) =========================
+LAT, LON, ELEV, TZ = -21.7, -41.3, 20, -3
+
+SYSTEM_CAP_KW = 1000.0
+TILT_DEG      = 21.5
+AZIMUTH_DEG   = 0.0
+DC_AC_RATIO   = 1.2
+LOSSES_PCT    = 14.0
+INVERTER_EFF  = 96.0
+MODULE_TYPE   = 0
+ARRAY_TYPE    = 0
+GCR           = 0.40
+
+MODEL     = "ACCESS-CM2"
+SCENARIOS_DEFAULT = ["ssp245", "ssp585"]
+YEARS_DEFAULT = list(range(1994, 2055))
+
+ERA5_BASE_YEAR = 2019
+CSV_ERA5_BASE  = r"C:\Users\alexs\clima_campos\ERA5_LAND_BAIXADO\_pvsam_hourly\solar_resource_hourly_lat-21.700_lon-41.300.csv"
+
+NEX_DIR_ROOT   = rf"C:\dados\nex_cmip6\{MODEL}"
+PLANILHA_ERA5  = r"C:\dados\exportacao_era5_com_precip_e_radiacao.xlsx"
+
+OUT_ROOT = r"C:\Users\alexs\clima_campos\resultados\SAM_MORPH"
+OUT_SAM_CSV_DIR = rf"{OUT_ROOT}\SAM_CSV_MORPH\{MODEL}"
+LOG_DIR         = rf"{OUT_ROOT}\logs_sam_morph_{MODEL}"
+OUT_RESULTS_CSV = rf"{OUT_ROOT}\resultado_sam_{MODEL}_morph.csv"
+OUT_CONSOLIDADO = rf"{OUT_ROOT}\resultado_sam_consolidado_{MODEL}_morph.csv"
+ANALISE_DIR     = rf"{OUT_ROOT}\analise_sam_{MODEL}"
+
+# cache climatologia (acelera bastante após 1ª vez)
+CLIM_CACHE_PATH = rf"{OUT_ROOT}\clim_cache_{MODEL}_lat{LAT:.3f}_lon{LON:.3f}.json"
+
+# relatório final
+REPORT_DIR = OUT_ROOT
+REPORT_PREFIX = "relatorio_pipeline"
+
+IRRAD_SCALE = None
+USE_YEARLY_WIND = True
+PLOT_RESULTS = True
+
+VARS = ["rsds", "tas", "sfcWind", "hurs"]
+
+# ======================================================================
+# ============================ RELATÓRIO ===============================
+# ======================================================================
+def _now_stamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+def _fmt_bool(x: bool) -> str:
+    return "OK" if x else "FALHA"
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        x = float(x)
+        if np.isfinite(x):
+            return x
+    except Exception:
+        return None
+    return None
+
+def _percent(n, d) -> float:
+    return float(100.0 * n / d) if d else 0.0
+
+class Report:
+    def __init__(self, model: str, years: List[int], scenarios: List[str], mode: str):
+        self.model = model
+        self.years = years
+        self.scenarios = scenarios
+        self.mode = mode
+        self.started_ts = time.time()
+        self.data: Dict[str, Any] = {
+            "meta": {
+                "model": model,
+                "mode": mode,
+                "years_min": int(min(years)) if years else None,
+                "years_max": int(max(years)) if years else None,
+                "n_years_requested": int(len(years)),
+                "scenarios": list(scenarios),
+                "has_tqdm": bool(HAS_TQDM),
+                "python_cwd": os.getcwd(),
+                "timestamp": _now_stamp(),
+            },
+            "config": {},
+            "precheck": {},
+            "climatology": {},
+            "runs": [],
+            "outputs": {},
+            "consolidation": {},
+            "analysis": {},
+            "warnings": [],
+            "errors": [],
+        }
+
+    def warn(self, msg: str) -> None:
+        self.data["warnings"].append(str(msg))
+
+    def error(self, msg: str) -> None:
+        self.data["errors"].append(str(msg))
+
+    def set(self, section: str, key: str, value: Any) -> None:
+        if section not in self.data:
+            self.data[section] = {}
+        self.data[section][key] = value
+
+    def add_run(self, row: Dict[str, Any]) -> None:
+        self.data["runs"].append(row)
+
+    def finalize(self) -> None:
+        elapsed = time.time() - self.started_ts
+        self.data["meta"]["elapsed_s"] = round(elapsed, 2)
+
+    def to_markdown(self) -> str:
+        m = self.data["meta"]
+        cfg = self.data["config"]
+        pre = self.data["precheck"]
+        clim = self.data["climatology"]
+        cons = self.data["consolidation"]
+        ana = self.data["analysis"]
+
+        runs = pd.DataFrame(self.data["runs"]) if self.data["runs"] else pd.DataFrame()
+        ok_runs = runs[runs.get("status", "").astype(str).eq("OK")] if not runs.empty else runs
+        err_runs = runs[runs.get("status", "").astype(str).eq("ERRO")] if not runs.empty else runs
+
+        lines: List[str] = []
+        lines.append(f"# Relatório do Pipeline SAM (morph) — {m.get('model')}")
+        lines.append("")
+        lines.append(f"- Data/hora: `{m.get('timestamp')}`")
+        lines.append(f"- Mode: `{m.get('mode')}`")
+        lines.append(f"- Cenários: `{', '.join(m.get('scenarios', []))}`")
+        lines.append(f"- Anos solicitados: `{m.get('years_min')}–{m.get('years_max')}` (n={m.get('n_years_requested')})")
+        lines.append(f"- Tempo total: `{m.get('elapsed_s')} s`")
+        lines.append("")
+        lines.append("## 1) Configuração e caminhos")
+        for k in ["CSV_ERA5_BASE","NEX_DIR_ROOT","OUT_ROOT","LOG_DIR","OUT_RESULTS_CSV","OUT_CONSOLIDADO","ANALISE_DIR","CLIM_CACHE_PATH"]:
+            if k in cfg:
+                lines.append(f"- **{k}**: `{cfg[k]}`")
+        lines.append("")
+        lines.append("## 2) Pré-check")
+        lines.append(f"- ERA5 base lido: **{_fmt_bool(bool(pre.get('era5_ok')))}**")
+        if pre.get("era5_ok"):
+            lines.append(f"  - Ano base: `{pre.get('era5_year')}` | linhas: `{pre.get('era5_rows')}`")
+            if pre.get("era5_cols"):
+                lines.append(f"  - Colunas: `{', '.join(pre.get('era5_cols'))}`")
+        else:
+            if pre.get("era5_error"):
+                lines.append(f"  - Erro: `{pre.get('era5_error')}`")
+
+        lines.append(f"- PySAM import: **{_fmt_bool(bool(pre.get('pysam_ok')))}**")
+        if not pre.get("pysam_ok") and pre.get("pysam_error"):
+            lines.append(f"  - Erro: `{pre.get('pysam_error')}`")
+
+        if "nex_sample" in pre:
+            lines.append("- NEX cobertura (amostra):")
+            for item in pre["nex_sample"]:
+                lines.append(f"  - {item}")
+
+        lines.append("")
+        lines.append("## 3) Climatologia histórica (1994–2014)")
+        lines.append(f"- Fonte: `{clim.get('source', 'NEX/ERA5/Cache')}`")
+        lines.append(f"- Cache usado: `{clim.get('cache_used')}` | cache salvo: `{clim.get('cache_saved')}` | rebuild: `{clim.get('rebuild')}`")
+        if clim.get("vars_available"):
+            lines.append(f"- Variáveis disponíveis: `{', '.join(clim['vars_available'])}`")
+        if clim.get("notes"):
+            lines.append(f"- Observações: {clim.get('notes')}")
+
+        lines.append("")
+        lines.append("## 4) Execuções (morph + valida + SAM)")
+        if runs.empty:
+            lines.append("_Nenhuma execução registrada (modo analyze ou falha cedo)._")
+        else:
+            n_total = len(runs)
+            n_ok = int((runs["status"] == "OK").sum()) if "status" in runs.columns else 0
+            n_err = int((runs["status"] == "ERRO").sum()) if "status" in runs.columns else 0
+            n_skip = int((runs["status"] == "SKIP_LOG_OK").sum()) if "status" in runs.columns else 0
+            lines.append(f"- Total de itens processados (inclui skip): `{n_total}`")
+            lines.append(f"- OK: `{n_ok}` ({_percent(n_ok, n_total):.1f}%) | ERRO: `{n_err}` ({_percent(n_err, n_total):.1f}%) | SKIP (log OK): `{n_skip}`")
+            if "tempo_total_ano_s" in runs.columns:
+                med = _safe_float(runs["tempo_total_ano_s"].median())
+                p90 = _safe_float(runs["tempo_total_ano_s"].quantile(0.9))
+                mx = _safe_float(runs["tempo_total_ano_s"].max())
+                lines.append(f"- Tempo por item (s): mediana `{med}` | p90 `{p90}` | max `{mx}`")
+
+            if not ok_runs.empty and "annual_mwh" in ok_runs.columns:
+                a = ok_runs["annual_mwh"].astype(float)
+                lines.append(f"- Energia anual (MWh) — min `{_safe_float(a.min())}` | med `{_safe_float(a.median())}` | max `{_safe_float(a.max())}`")
+            if not err_runs.empty:
+                lines.append("")
+                lines.append("### Erros (primeiros 10)")
+                subset = err_runs.head(10)
+                for _, r in subset.iterrows():
+                    lines.append(f"- `{r.get('ssp')}` `{int(r.get('ano'))}`: {r.get('erro')}")
+
+        lines.append("")
+        lines.append("## 5) Consolidação de logs")
+        lines.append(f"- Consolidado gerado: `{cons.get('out_path')}`")
+        if cons.get("n_rows") is not None:
+            lines.append(f"- Linhas: `{cons.get('n_rows')}`")
+        if cons.get("status_counts"):
+            sc = cons["status_counts"]
+            lines.append(f"- Contagem por status: OK `{sc.get('OK',0)}` | ERRO `{sc.get('ERRO',0)}` | SEM_LOG `{sc.get('SEM_LOG',0)}`")
+        if cons.get("ssp_counts"):
+            lines.append("- Linhas por SSP:")
+            for k, v in cons["ssp_counts"].items():
+                lines.append(f"  - `{k}`: `{v}`")
+
+        lines.append("")
+        lines.append("## 6) Análise")
+        lines.append(f"- Pasta: `{ana.get('dir')}`")
+        if ana.get("files"):
+            lines.append("- Arquivos gerados:")
+            for f in ana["files"]:
+                lines.append(f"  - `{f}`")
+        if ana.get("figs"):
+            lines.append("- Figuras:")
+            for f in ana["figs"]:
+                lines.append(f"  - `{f}`")
+
+        lines.append("")
+        lines.append("## 7) Recomendações antes do run pesado")
+        recs: List[str] = []
+        if not bool(pre.get("era5_ok")):
+            recs.append("Corrigir ERA5 base (colunas/NaN/8760 linhas) antes de rodar pesado.")
+        if not bool(pre.get("pysam_ok")):
+            recs.append("Instalar/validar NREL-PySAM no mesmo Python do .venv.")
+        if runs is not None and not runs.empty and ("status" in runs.columns) and (runs["status"] == "ERRO").any():
+            recs.append("Há erros no teste/bloco atual. Rode com --stop-on-error num intervalo pequeno para depurar primeiro.")
+        if cons.get("status_counts", {}).get("ERRO", 0) > 0:
+            recs.append("O consolidado tem linhas com ERRO. Verifique logs correspondentes e corriga antes de rodar 1994–2054.")
+        if not recs:
+            recs.append("Tudo parece consistente. Pode rodar em blocos (ex.: 1994–2004, 2005–2014, 2015–2034, 2035–2054) SEM --force para permitir retomada.")
+        for r in recs:
+            lines.append(f"- {r}")
+
+        if self.data["warnings"]:
+            lines.append("")
+            lines.append("## Avisos")
+            for w in self.data["warnings"]:
+                lines.append(f"- {w}")
+
+        if self.data["errors"]:
+            lines.append("")
+            lines.append("## Erros registrados")
+            for e in self.data["errors"]:
+                lines.append(f"- {e}")
+
+        lines.append("")
+        lines.append("---")
+        lines.append("Gerado automaticamente pelo pipeline (v4).")
+        return "\n".join(lines)
+
+def write_report(report: Report) -> str:
+    report.finalize()
+    md = report.to_markdown()
+    Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+    out = Path(REPORT_DIR) / f"{REPORT_PREFIX}_{MODEL}_{_now_stamp()}.md"
+    out.write_text(md, encoding="utf-8")
+    return str(out)
+
+# ======================================================================
+# ============================ UTILIDADES ===============================
+# ======================================================================
+def ensure_datetime(series: pd.Series) -> pd.Series:
+    s = pd.to_datetime(series, errors="coerce", utc=False)
+    if getattr(s.dtype, "tz", None) is not None:
+        try:
+            s = s.dt.tz_convert(None)
+        except Exception:
+            s = s.dt.tz_localize(None)
+    if s.isna().any():
+        raise ValueError(f"Falha ao converter DateTime: {int(s.isna().sum())} linhas inválidas.")
+    return s
+
+def _guess_irr_scale(df: pd.DataFrame) -> float:
+    ghi = pd.to_numeric(df.get("GHI", pd.Series(dtype=float)), errors="coerce")
+    p95 = np.nanpercentile(ghi, 95) if len(ghi) else np.nan
+    if not np.isfinite(p95) or p95 <= 0:
+        return 1.0
+    target = 900.0
+    scale = target / p95
+    return float(np.clip(scale, 0.1, 100.0))
+
+def read_era5_base(path: str, base_year: int) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "DateTime" not in df.columns:
+        raise ValueError("CSV ERA5 base precisa ter coluna DateTime.")
+    df["DateTime"] = ensure_datetime(df["DateTime"]).dt.floor("h")
+    df = df.sort_values("DateTime")
+
+    req = ["GHI","DNI","DHI","TempC","WindSpeed","RelHum"]
+    for c in req:
+        if c not in df.columns:
+            raise ValueError(f"Falta coluna {c} no ERA5 base.")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if df[req].isna().any().any():
+        raise ValueError("NaN no ERA5 base.")
+
+    years = df["DateTime"].dt.year.unique()
+    if len(years) > 1:
+        df = df[df["DateTime"].dt.year == int(base_year)].copy()
+        if df.empty:
+            raise ValueError(f"ERA5 base: ano {base_year} não encontrado no arquivo {path}.")
+
+    if len(df) == 8784:
+        df = df.loc[~((df["DateTime"].dt.month==2) & (df["DateTime"].dt.day==29))].copy()
+
+    if len(df) != 8760:
+        raise ValueError(f"ERA5 base tem {len(df)} linhas (esperado 8760) após filtrar ano {base_year}.")
+
+    scale = _guess_irr_scale(df) if IRRAD_SCALE is None else float(IRRAD_SCALE)
+    if abs(scale - 1.0) > 1e-6:
+        for c in ["GHI","DNI","DHI"]:
+            df[c] = df[c].astype(float) * scale
+
+    df["month"] = df["DateTime"].dt.month.astype(int)
+    return df
+
+def _find_first_existing(base: Path, patterns: List[str]) -> Optional[Path]:
+    for pat in patterns:
+        hits = list(base.rglob(pat))
+        if hits:
+            return hits[0]
+    return None
+
+# ======================================================================
+# ==================== PONTO (nearest) ROBUSTO ==========================
+# ======================================================================
+_POINT_INDEX_CACHE: Dict[Tuple[Tuple[str, ...], Tuple[int, ...], float, float, bool], Dict[str, int]] = {}
+
+def _needs_lon360(lons: np.ndarray) -> bool:
+    try:
+        return np.nanmin(lons) >= 0
+    except Exception:
+        return False
+
+def _find_point_index_from_latlon_grids(latv: xr.DataArray, lonv: xr.DataArray) -> Dict[str, int]:
+    dims = tuple(latv.dims)
+    shape = tuple(int(s) for s in latv.shape)
+    key = (dims, shape, float(LAT), float(LON), bool(_needs_lon360(lonv.values)))
+    if key in _POINT_INDEX_CACHE:
+        return _POINT_INDEX_CACHE[key]
+
+    lon_pt = float(LON)
+    lon_arr = lonv.values
+    if _needs_lon360(lon_arr) and lon_pt < 0:
+        lon_pt = 360.0 + lon_pt
+
+    if latv.ndim == 1 and lonv.ndim == 1:
+        iy = int(np.nanargmin(np.abs(latv.values - float(LAT))))
+        ix = int(np.nanargmin(np.abs(lonv.values - lon_pt)))
+        out = {latv.dims[0]: iy, lonv.dims[0]: ix}
+        _POINT_INDEX_CACHE[key] = out
+        return out
+
+    lat_arr = latv.values.astype(np.float32, copy=False)
+    lon_arr = lonv.values.astype(np.float32, copy=False)
+    d2 = (lat_arr - np.float32(LAT))**2 + (lon_arr - np.float32(lon_pt))**2
+    flat_idx = int(np.nanargmin(d2))
+    iy, ix = np.unravel_index(flat_idx, d2.shape)
+    out = {latv.dims[0]: int(iy), latv.dims[1]: int(ix)}
+    _POINT_INDEX_CACHE[key] = out
+    return out
+
+def _monthly_mean_at_point(ds: xr.Dataset, vname: str) -> pd.Series:
+    da = ds[vname]
+    latn = next((n for n in ["lat","latitude"] if n in da.coords), None)
+    lonn = next((n for n in ["lon","longitude"] if n in da.coords), None)
+
+    if latn and lonn:
+        lon_pt = float(LON)
+        lons = da[lonn].values
+        if _needs_lon360(lons) and lon_pt < 0:
+            lon_pt = 360.0 + lon_pt
+        try:
+            da_pt = da.sel({latn: float(LAT), lonn: lon_pt}, method="nearest")
+        except Exception:
+            iy = int(np.nanargmin(np.abs(da[latn].values - float(LAT))))
+            ix = int(np.nanargmin(np.abs(da[lonn].values - lon_pt)))
+            da_pt = da.isel({latn: iy, lonn: ix})
+    else:
+        cand_lat = next((n for n in ["lat","latitude"] if n in ds.variables), None)
+        cand_lon = next((n for n in ["lon","longitude"] if n in ds.variables), None)
+        if cand_lat and cand_lon:
+            latv = ds[cand_lat]
+            lonv = ds[cand_lon]
+            idx = _find_point_index_from_latlon_grids(latv, lonv)
+            da_pt = da.isel(idx)
+        else:
+            spdims = [d for d in da.dims if d.lower() in ("lat","latitude","lon","longitude","x","y")]
+            if spdims:
+                da_pt = da.mean(dim=spdims, keep_attrs=True)
+            else:
+                da_pt = da
+
+    if "time" not in da_pt.dims:
+        raise ValueError(f"Não consegui reduzir '{vname}' para dimensão time. Dims atuais: {da_pt.dims}")
+
+    m = da_pt.groupby("time.month").mean("time").to_pandas()
+    m.index = range(1, 13)
+    if len(m) != 12:
+        raise ValueError(f"Série mensal com {len(m)} meses (esperado 12) em '{vname}'.")
+    return m.astype(float)
+
+# ======================================================================
+# ======================== LEITURA NEX (v3) ============================
+# ======================================================================
+def _load_nex_one_year_monthly(var: str, year: int, ssp: str) -> pd.Series:
+    base = Path(NEX_DIR_ROOT) / ssp
+    patterns = [
+        f"{var}_day_{MODEL}_{ssp}_*_gn_{year}.nc",
+        f"{var}_day_{MODEL}_{ssp}_*_gn_{year}_*.nc",
+        f"{var}_day_{MODEL}_{ssp}_r1i1p1f1_gn_{year}.nc",
+        f"{var}_day_{MODEL}_{ssp}_r1i1p1f1_gn_{year}_*.nc",
+        f"{var}_day_{MODEL}_{ssp}_*_{year}.nc",
+        f"{var}_day_{MODEL}_{ssp}_*_{year}_*.nc",
+        f"{var}_day_{MODEL}_{ssp}_*_gn_{year}_v2.0.nc",
+        f"{var}_day_{MODEL}_{ssp}_*_gn_{year}_v2.0_*.nc",
+    ]
+    p = _find_first_existing(base, patterns)
+    if p is None:
+        raise FileNotFoundError(f"NEX {ssp} {year} {var} não encontrado em {base}")
+
+    with xr.open_dataset(p) as ds:
+        vname = var if var in ds.data_vars else list(ds.data_vars)[0]
+        return _monthly_mean_at_point(ds, vname)
+
+def _load_nex_hist_monthly(var: str, years=range(1994, 2015)) -> pd.Series:
+    base = Path(NEX_DIR_ROOT) / "historical"
+    sum_m = pd.Series({m: 0.0 for m in range(1, 13)}, dtype=float)
+    cnt_m = pd.Series({m: 0 for m in range(1, 13)}, dtype=int)
+    found_any = False
+
+    for y in years:
+        p = _find_first_existing(base, [
+            f"{var}_day_{MODEL}_historical_*_gn_{y}_*.nc",
+            f"{var}_day_{MODEL}_historical_*_{y}_*.nc",
+            f"{var}_day_{MODEL}_historical_r1i1p1f1_gn_{y}.nc",
+            f"{var}_day_{MODEL}_historical_r1i1p1f1_gn_{y}_v2.0.nc",
+            f"{var}_day_{MODEL}_historical_r1i1p1f1_gn_{y}.nc4",
+        ])
+        if p is None:
+            continue
+
+        with xr.open_dataset(p) as ds:
+            vname = var if var in ds.data_vars else list(ds.data_vars)[0]
+            m = _monthly_mean_at_point(ds, vname)
+
+        found_any = True
+        sum_m = sum_m.add(m, fill_value=0.0)
+        cnt_m = cnt_m.add((~m.isna()).astype(int), fill_value=0).astype(int)
+
+    if not found_any:
+        raise FileNotFoundError(f"NEX historical {var} não encontrado em {base} (1994–2014).")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = (sum_m / cnt_m.replace(0, np.nan)).astype(float)
+    out.index = range(1, 13)
+    if out.isna().any():
+        missing = out[out.isna()].index.tolist()
+        raise ValueError(f"Climatologia {var} ficou com meses NaN: {missing}. Verifique arquivos faltantes.")
+    return out
+
+# ======================================================================
+# ====================== FALLBACK PLANILHA (igual) ======================
+# ======================================================================
+def _load_rsds_tas_from_planilha(planilha_path: str) -> Dict[str, pd.Series]:
+    def norm(c):
+        c = str(c)
+        c = re.sub(r"\(.*?\)", "", c)
+        c = c.replace("%", "")
+        return c.strip().lower()
+
+    xls = pd.ExcelFile(planilha_path)
+    chosen = None
+    for sh in xls.sheet_names:
+        d = pd.read_excel(planilha_path, sheet_name=sh)
+        d = d.rename(columns={c: norm(c) for c in d.columns})
+        has_date = any(c in d.columns for c in ["data","date","datetime"])
+        has_ssr  = any("ssr" in c for c in d.columns)
+        has_skt  = any(c.startswith("skt") for c in d.columns)
+        if has_date and (has_ssr or has_skt):
+            col_date = next(c for c in d.columns if c in ["data","date","datetime"])
+            col_ssr  = next((c for c in d.columns if "ssr" in c), None)
+            col_skt  = next((c for c in d.columns if c.startswith("skt")), None)
+            chosen = (d, col_date, col_ssr, col_skt)
+            break
+    if not chosen:
+        raise FileNotFoundError("Planilha não possui colunas esperadas (Data/SSR/SKT).")
+
+    d, col_date, col_ssr, col_skt = chosen
+    d[col_date] = pd.to_datetime(d[col_date], dayfirst=True, errors="coerce")
+    d = d.dropna(subset=[col_date])
+    d = d[(d[col_date].dt.year>=1994) & (d[col_date].dt.year<=2014)]
+
+    def to_num(s):
+        if s.dtype == "O":
+            s = s.astype(str).str.replace(",", ".", regex=False).str.replace("\u00a0","",regex=False)
+        return pd.to_numeric(s, errors="coerce")
+
+    out: Dict[str, pd.Series] = {}
+    if col_ssr:
+        d[col_ssr] = to_num(d[col_ssr])
+        d["month"] = d[col_date].dt.month
+        m = d.groupby("month")[col_ssr].mean()
+        m.index = range(1,13)
+        out["rsds"] = m.astype(float)
+
+    if col_skt:
+        d[col_skt] = to_num(d[col_skt])
+        d["month"] = d[col_date].dt.month
+        m = d.groupby("month")[col_skt].mean()
+        m.index = range(1,13)
+        out["tas"] = m.astype(float)
+
+    if "rsds" not in out and "tas" not in out:
+        raise FileNotFoundError("Planilha não trouxe rsds/tas utilizáveis.")
+    return out
+
+def _load_wind_clim_from_era5_pvsam_csv(csv_path: str, years=range(1994, 2015)) -> pd.Series:
+    usecols = ["DateTime", "WindSpeed"]
+    df = pd.read_csv(csv_path, usecols=usecols)
+    df["DateTime"] = ensure_datetime(df["DateTime"])
+    df["WindSpeed"] = pd.to_numeric(df["WindSpeed"], errors="coerce")
+    df = df.dropna(subset=["DateTime", "WindSpeed"])
+    df = df[df["DateTime"].dt.year.isin(list(years))].copy()
+    if df.empty:
+        raise FileNotFoundError("Não consegui extrair vento 1994–2014 do CSV ERA5 PVSam.")
+    df["month"] = df["DateTime"].dt.month.astype(int)
+    m = df.groupby("month")["WindSpeed"].mean()
+    m.index = range(1, 13)
+    if len(m) != 12:
+        raise ValueError(f"Climatologia vento com {len(m)} meses (esperado 12).")
+    return m.astype(float)
+
+def _as_monthly_series(x, name: str, allow_none=False, fill=None) -> pd.Series:
+    if x is None:
+        if allow_none:
+            return pd.Series({m: float(fill) for m in range(1, 13)}, dtype=float)
+        raise ValueError(f"Climatologia/futuro de '{name}' está ausente (None).")
+    if isinstance(x, (int, float, np.floating)):
+        return pd.Series({m: float(x) for m in range(1, 13)}, dtype=float)
+    s = pd.Series(x)
+    if len(s) != 12:
+        raise ValueError(f"'{name}' deveria ter 12 valores mensais, mas veio com {len(s)}.")
+    s.index = range(1, 13)
+    return s.astype(float)
+
+def _write_clim_cache(clim: Dict[str, pd.Series]) -> bool:
+    try:
+        payload = {k: [float(x) for x in v.values] for k, v in clim.items() if v is not None}
+        Path(CLIM_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(CLIM_CACHE_PATH).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print("[ClimCache] Salvo:", CLIM_CACHE_PATH)
+        return True
+    except Exception as e:
+        print("[ClimCache] Não consegui salvar cache:", e)
+        return False
+
+def _read_clim_cache() -> Optional[Dict[str, pd.Series]]:
+    p = Path(CLIM_CACHE_PATH)
+    if not p.exists():
+        return None
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        out: Dict[str, pd.Series] = {}
+        for k, arr in payload.items():
+            s = pd.Series(arr, index=range(1, 13), dtype=float)
+            out[k] = s
+        if all(k in out for k in ["rsds","tas","sfcWind"]):
+            print("[ClimCache] Usando cache:", CLIM_CACHE_PATH)
+            return out
+    except Exception as e:
+        print("[ClimCache] Cache inválido, recalculando. Motivo:", e)
+    return None
+
+def load_hist_clims(rebuild: bool = False, report: Optional[Report] = None) -> Dict[str, pd.Series]:
+    cache_used = False
+    cache_saved = False
+    notes: List[str] = []
+
+    if not rebuild:
+        cached = _read_clim_cache()
+        if cached:
+            cache_used = True
+            if report:
+                report.set("climatology", "cache_used", True)
+                report.set("climatology", "cache_saved", False)
+                report.set("climatology", "rebuild", False)
+                report.set("climatology", "vars_available", sorted(list(cached.keys())))
+                report.set("climatology", "source", "cache")
+            return cached
+
+    clim: Dict[str, pd.Series] = {}
+
+    for v in ["rsds", "tas"]:
+        try:
+            clim[v] = _load_nex_hist_monthly(v)
+        except Exception as e:
+            if Path(PLANILHA_ERA5).exists():
+                notes.append(f"Usou fallback planilha para {v}.")
+                print(f"[AVISO] Usando climatologia da planilha para '{v}' (1994–2014).")
+                plan = _load_rsds_tas_from_planilha(PLANILHA_ERA5)
+                if v in plan and plan[v] is not None and len(plan[v]) == 12:
+                    clim[v] = plan[v].astype(float)
+            if v not in clim:
+                raise e
+
+    try:
+        clim["sfcWind"] = _load_wind_clim_from_era5_pvsam_csv(CSV_ERA5_BASE)
+        notes.append("Vento climatológico veio do ERA5 PVSam (CSV base).")
+    except Exception:
+        print("[AVISO] Não consegui climatologia de vento via ERA5 PVSam. Tentando NEX historical para sfcWind.")
+        clim["sfcWind"] = _load_nex_hist_monthly("sfcWind")
+        notes.append("Vento climatológico veio do NEX historical (fallback).")
+
+    try:
+        clim["hurs"] = _load_nex_hist_monthly("hurs")
+    except Exception:
+        print("[AVISO] Climatologia histórica de 'hurs' indisponível. Delta 0% será usado.")
+        notes.append("hurs histórico indisponível: delta 0% será aplicado.")
+
+    cache_saved = _write_clim_cache(clim)
+
+    if report:
+        report.set("climatology", "cache_used", cache_used)
+        report.set("climatology", "cache_saved", cache_saved)
+        report.set("climatology", "rebuild", bool(rebuild))
+        report.set("climatology", "vars_available", sorted(list(clim.keys())))
+        report.set("climatology", "source", "computed")
+        if notes:
+            report.set("climatology", "notes", "; ".join(notes))
+
+    return clim
+
+def load_future_monthly(ssp: str, year: int) -> Dict[str, Optional[pd.Series]]:
+    ssp_name = ssp if year >= 2015 else "historical"
+    fut: Dict[str, Optional[pd.Series]] = {}
+    for v in VARS:
+        try:
+            fut[v] = _load_nex_one_year_monthly(v, year, ssp_name)
+        except Exception:
+            if v == "hurs":
+                fut[v] = None
+            else:
+                raise
+    return fut
+
+def morph_one_year(ssp: str, year: int, rebuild_clim: bool = False, report: Optional[Report] = None) -> str:
+    base = read_era5_base(CSV_ERA5_BASE, ERA5_BASE_YEAR)
+    clim = load_hist_clims(rebuild=rebuild_clim, report=report)
+    fut  = load_future_monthly(ssp, year)
+
+    clim_rsds = _as_monthly_series(clim.get("rsds"), "clim.rsds")
+    clim_tas  = _as_monthly_series(clim.get("tas"),  "clim.tas")
+    clim_wspd = _as_monthly_series(clim.get("sfcWind"), "clim.sfcWind")
+
+    fut_rsds  = _as_monthly_series(fut.get("rsds"), "fut.rsds")
+    fut_tas   = _as_monthly_series(fut.get("tas"),  "fut.tas")
+    fut_wspd  = _as_monthly_series(fut.get("sfcWind"), "fut.sfcWind")
+
+    if fut.get("hurs") is None:
+        fut_hurs  = _as_monthly_series(None, "fut.hurs", allow_none=True, fill=0.0)
+        clim_hurs = _as_monthly_series(clim.get("hurs", fut_hurs*0.0), "clim.hurs", allow_none=True, fill=0.0)
+    else:
+        fut_hurs  = _as_monthly_series(fut.get("hurs"), "fut.hurs")
+        clim_hurs = _as_monthly_series(clim.get("hurs"), "clim.hurs")
+
+    k_rsds = (fut_rsds / clim_rsds).astype(float)
+    d_tas  = (fut_tas  - clim_tas).astype(float)
+    k_wspd = (fut_wspd / clim_wspd).astype(float) if USE_YEARLY_WIND else pd.Series({m: 1.0 for m in range(1,13)}, dtype=float)
+    d_hurs = (fut_hurs - clim_hurs).astype(float)
+
+    df = base.copy()
+
+    df["GHI"] = (df["GHI"] * df["month"].map(k_rsds.to_dict())).clip(lower=0)
+
+    eps = 1e-6
+    with np.errstate(divide='ignore', invalid='ignore'):
+        frac_dni = (df["DNI"] / (df["GHI"] + eps)).clip(0, 1).fillna(0.0)
+    frac_dhi = (1.0 - frac_dni).clip(0, 1)
+    df["DNI"] = df["GHI"] * frac_dni
+    df["DHI"] = df["GHI"] * frac_dhi
+
+    df["TempC"]     = df["TempC"] + df["month"].map(d_tas.to_dict())
+    df["WindSpeed"] = (df["WindSpeed"] * df["month"].map(k_wspd.to_dict())).clip(lower=0)
+    df["RelHum"]    = (df["RelHum"] + df["month"].map(d_hurs.to_dict())).clip(0, 100)
+
+    dt0 = df["DateTime"].dt
+    df["DateTime"] = pd.to_datetime({"year": year, "month": dt0.month, "day": dt0.day, "hour": dt0.hour})
+
+    out_subdir = "historical" if year < 2015 else ssp
+    outdir = Path(OUT_SAM_CSV_DIR) / out_subdir
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_path = outdir / f"SAM_{MODEL}_{out_subdir}_{year}_morph.csv"
+    df[["DateTime","GHI","DNI","DHI","TempC","WindSpeed","RelHum"]].to_csv(out_path, index=False)
+    return str(out_path)
+
+def validate_sam_csv(path: str) -> Dict[str, Any]:
+    df = pd.read_csv(path)
+    if "DateTime" not in df.columns:
+        raise ValueError("CSV sem DateTime.")
+    df["DateTime"] = ensure_datetime(df["DateTime"])
+    req = ["GHI","DNI","DHI","TempC","WindSpeed","RelHum"]
+    for c in req:
+        if c not in df.columns:
+            raise ValueError(f"Falta {c}.")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if df[req].isna().any().any():
+        raise ValueError("NaN após morph.")
+    if len(df) == 8784:
+        df = df.loc[~((df["DateTime"].dt.month==2) & (df["DateTime"].dt.day==29))]
+    if len(df) != 8760:
+        raise ValueError(f"{os.path.basename(path)} tem {len(df)} linhas (esperado 8760).")
+
+    stats = {
+        "rows": int(len(df)),
+        "ghi_p95": float(np.nanpercentile(df["GHI"].values, 95)),
+        "temp_mean": float(np.nanmean(df["TempC"].values)),
+        "wind_mean": float(np.nanmean(df["WindSpeed"].values)),
+        "rh_mean": float(np.nanmean(df["RelHum"].values)),
+    }
+    return stats
+
+def df_to_solar_resource(df: pd.DataFrame) -> dict:
+    dt = df["DateTime"]
+    return {
+        "lat": LAT, "lon": LON, "elev": ELEV, "tz": TZ,
+        "year":   dt.dt.year.tolist(),
+        "month":  dt.dt.month.tolist(),
+        "day":    dt.dt.day.tolist(),
+        "hour":   dt.dt.hour.tolist(),
+        "minute": [0]*len(df),
+        "gh":   df["GHI"].astype(float).tolist(),
+        "dn":   df["DNI"].astype(float).tolist(),
+        "df":   df["DHI"].astype(float).tolist(),
+        "tdry": df["TempC"].astype(float).tolist(),
+        "wspd": df["WindSpeed"].astype(float).tolist(),
+        "rh":   df["RelHum"].astype(float).tolist(),
+    }
+
+def _pysam_preflight() -> None:
+    try:
+        import PySAM.Pvwattsv8 as Pvwattsv8  # noqa: F401
+    except Exception as e:
+        raise RuntimeError(
+            "Falha ao importar PySAM.Pvwattsv8. "
+            "Verifique se o NREL-PySAM está instalado e compatível com seu Python/OS. "
+            f"Erro original: {e}"
+        )
+
+def run_sam_from_csv(path: str) -> dict:
+    import PySAM.Pvwattsv8 as Pvwattsv8
+
+    df = pd.read_csv(path, parse_dates=["DateTime"])
+    if len(df) == 8784:
+        df = df.loc[~((df["DateTime"].dt.month==2) & (df["DateTime"].dt.day==29))]
+    if len(df) != 8760:
+        raise ValueError("CSV não está com 8760 linhas.")
+
+    m = Pvwattsv8.new()
+    m.SystemDesign.system_capacity = SYSTEM_CAP_KW
+    m.SystemDesign.module_type = MODULE_TYPE
+    m.SystemDesign.array_type  = ARRAY_TYPE
+    m.SystemDesign.tilt        = TILT_DEG
+    m.SystemDesign.azimuth     = AZIMUTH_DEG
+    m.SystemDesign.gcr         = GCR
+    m.SystemDesign.dc_ac_ratio = DC_AC_RATIO
+    m.SystemDesign.inv_eff     = INVERTER_EFF
+    m.SystemDesign.losses      = LOSSES_PCT
+
+    m.SolarResource.solar_resource_data = df_to_solar_resource(df)
+
+    t0 = time.time()
+    m.execute()
+    elapsed = time.time() - t0
+
+    annual_kwh = float(m.Outputs.annual_energy)
+    return {
+        "arquivo": os.path.basename(path),
+        "annual_mwh": round(annual_kwh/1000.0, 3),
+        "capacity_factor": float(m.Outputs.capacity_factor)/100.0,
+        "ac_monthly_kwh": [float(x) for x in m.Outputs.ac_monthly],
+        "tempo_s": round(elapsed, 2),
+    }
+
+# ======================================================================
+# ===================== CONSOLIDADOR DE LOGS ===========================
+# ======================================================================
+def parse_log_file(fp: Path) -> dict:
+    txt = fp.read_text(encoding="utf-8", errors="ignore").strip()
+    try:
+        data = json.loads(txt)
+        return {"ok": True, "data": data, "msg": None}
+    except Exception:
+        pass
+    try:
+        m = re.search(r"\{.*\}", txt, flags=re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            return {"ok": True, "data": data, "msg": None}
+    except Exception:
+        pass
+    m = re.search(r"ERRO:\s*(.+)", txt)
+    if m:
+        return {"ok": False, "data": None, "msg": m.group(1).strip()}
+    return {"ok": False, "data": None, "msg": "Formato de log não reconhecido."}
+
+def consolidate_logs(model: str, dir_logs: str, dir_csvs_root: str, out_path: str) -> pd.DataFrame:
+    p_logs = Path(dir_logs)
+    p_csvs = Path(dir_csvs_root) / model
+
+    rows = []
+
+    csv_map: Dict[Tuple[str,int], str] = {}
+    for sub in ["historical", "ssp245", "ssp585"]:
+        base = p_csvs / sub
+        if not base.exists():
+            continue
+        for fp in base.glob("SAM_*_%s_*_morph.csv" % sub):
+            m = re.search(r"_(\d{4})_morph\.csv$", fp.name)
+            if not m:
+                continue
+            ano = int(m.group(1))
+            csv_map[(sub, ano)] = str(fp)
+
+    for fp in sorted(p_logs.glob("log_*.txt")):
+        m = re.match(r"log_(historical|ssp245|ssp585)_(\d{4})\.txt$", fp.name)
+        if not m:
+            continue
+        ssp = m.group(1)
+        ano = int(m.group(2))
+
+        parsed = parse_log_file(fp)
+        annual_mwh = np.nan
+        capacity_factor = np.nan
+        tempo_s = np.nan
+        log_status = "OK" if parsed["ok"] else "ERRO"
+        log_msg = parsed["msg"]
+
+        if parsed["ok"] and parsed["data"]:
+            d = parsed["data"]
+            annual_mwh = d.get("annual_mwh", np.nan)
+            capacity_factor = d.get("capacity_factor", np.nan)
+            tempo_s = d.get("tempo_s", np.nan)
+            if d.get("erro"):
+                log_status = "ERRO"
+                log_msg = d["erro"]
+
+        caminho_csv = csv_map.get((ssp, ano))
+        if caminho_csv is None:
+            csv_guess = p_csvs / ssp / f"SAM_{model}_{ssp}_{ano}_morph.csv"
+            caminho_csv = str(csv_guess)
+            if not csv_guess.exists():
+                caminho_csv += " (NAO_ENCONTRADO)"
+
+        rows.append({
+            "modelo": model,
+            "ssp": ssp,
+            "ano": ano,
+            "annual_mwh": annual_mwh,
+            "capacity_factor": capacity_factor,
+            "tempo_s": tempo_s,
+            "caminho_csv": caminho_csv,
+            "log_arquivo": str(fp),
+            "log_status": log_status,
+            "log_msg": log_msg,
+        })
+
+    for (ssp, ano), path_csv in csv_map.items():
+        if not any((r["ssp"], r["ano"]) == (ssp, ano) for r in rows):
+            rows.append({
+                "modelo": model,
+                "ssp": ssp,
+                "ano": ano,
+                "annual_mwh": np.nan,
+                "capacity_factor": np.nan,
+                "tempo_s": np.nan,
+                "caminho_csv": path_csv,
+                "log_arquivo": "",
+                "log_status": "SEM_LOG",
+                "log_msg": "Sem log correspondente.",
+            })
+
+    df = pd.DataFrame(rows).sort_values(["ssp","ano"]).reset_index(drop=True)
+    cols = ["modelo","ssp","ano","annual_mwh","capacity_factor","tempo_s",
+            "caminho_csv","log_arquivo","log_status","log_msg"]
+    df = df[cols]
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return df
+
+# ======================================================================
+# ============================ ANÁLISE =================================
+# ======================================================================
+def _safe_pct(a, b):
+    if b is None or not np.isfinite(b) or b == 0:
+        return np.nan
+    return 100.0 * (a - b) / b
+
+def _rolling(series, win=5):
+    return series.rolling(win, min_periods=max(1, win//2)).mean()
+
+def _linear_trend(years, values):
+    s = pd.Series(values, index=years).dropna()
+    if len(s) < 3:
+        return np.nan, np.nan
+    x = s.index.values.astype(float)
+    y = s.values.astype(float)
+    a, b = np.polyfit(x, y, 1)
+    y_hat = a*x + b
+    ss_res = np.sum((y - y_hat)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
+    mean_val = np.mean(y) if np.isfinite(np.mean(y)) and np.mean(y) != 0 else np.nan
+    if not np.isfinite(mean_val) or mean_val == 0:
+        return np.nan, r2
+    slope_decadal_pct = (a * 10.0 / mean_val) * 100.0
+    return slope_decadal_pct, r2
+
+def analyze_results(consolidado_csv: str, out_dir: str,
+                    scenarios_order=None, baseline_years=None, make_plots=True) -> None:
+    out_dir = Path(out_dir)
+    fig_dir = out_dir / "figs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(consolidado_csv)
+    if "log_status" in df.columns:
+        df = df[df["log_status"].astype(str).str.upper().eq("OK")].copy()
+
+    required = ["modelo", "ssp", "ano", "annual_mwh", "capacity_factor"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Faltam colunas na base de análise: {missing}. Colunas atuais: {list(df.columns)}")
+
+    df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+    df["annual_mwh"] = pd.to_numeric(df["annual_mwh"], errors="coerce")
+    df["capacity_factor"] = pd.to_numeric(df["capacity_factor"], errors="coerce")
+    df["ssp"] = df["ssp"].astype(str)
+
+    if scenarios_order is None:
+        scenarios_order = ["historical", "ssp245", "ssp585"]
+    if baseline_years is None:
+        baseline_years = list(range(1994, 2015))
+
+    df["ssp"] = pd.Categorical(df["ssp"], categories=scenarios_order, ordered=True)
+    df = df.sort_values(["ssp", "ano"]).reset_index(drop=True)
+
+    base_ref = df[(df["ano"].isin(baseline_years)) & (df["ssp"].astype(str).str.contains("historical"))]
+    if base_ref.empty:
+        base_ref = df[df["ano"].isin(baseline_years)]
+
+    baseline_stats = (
+        base_ref.groupby("ssp")[["annual_mwh", "capacity_factor"]]
+        .mean()
+        .rename(columns={"annual_mwh": "baseline_mwh", "capacity_factor": "baseline_cf"})
+        .reset_index()
+    )
+
+    df = df.merge(baseline_stats, on="ssp", how="left")
+    df["delta_mwh_pct"] = df.apply(lambda r: _safe_pct(r["annual_mwh"], r["baseline_mwh"]), axis=1)
+    df["delta_cf_pct"]  = df.apply(lambda r: _safe_pct(r["capacity_factor"], r["baseline_cf"]), axis=1)
+
+    df["rolling5_mwh"] = (
+        df.sort_values(["ssp","ano"])
+          .groupby("ssp")["annual_mwh"]
+          .transform(lambda s: _rolling(s, win=5))
+    )
+
+    coverage = (
+        df.groupby("ssp")["ano"]
+          .agg(["min", "max", "count"])
+          .rename(columns={"min":"ano_min","max":"ano_max","count":"n_anos"})
+          .reset_index()
+    )
+    coverage.to_csv(out_dir / "coverage.csv", index=False, encoding="utf-8")
+
+    trend_rows = []
+    for ssp, g in df.groupby("ssp"):
+        years = g["ano"].dropna().astype(int).tolist()
+        slope_mwh_pct_dec, r2_mwh = _linear_trend(years, g["annual_mwh"].tolist())
+        slope_cf_pct_dec,  r2_cf  = _linear_trend(years, g["capacity_factor"].tolist())
+        trend_rows.append({
+            "ssp": str(ssp),
+            "slope_mwh_pct_per_decade": slope_mwh_pct_dec,
+            "r2_mwh": r2_mwh,
+            "slope_cf_pct_per_decade": slope_cf_pct_dec,
+            "r2_cf": r2_cf,
+            "anos": f"{min(years)}–{max(years)}" if years else "",
+            "n": len(years),
+        })
+    pd.DataFrame(trend_rows).to_csv(out_dir / "trends.csv", index=False, encoding="utf-8")
+
+    def decade_of(y: int) -> str:
+        d0 = int(y//10)*10
+        return f"{d0}s"
+
+    df["decada"] = df["ano"].astype(int).apply(decade_of)
+    df_decadal = (
+        df.groupby(["ssp","decada"]) [["annual_mwh","capacity_factor","delta_mwh_pct","delta_cf_pct"]]
+          .mean()
+          .reset_index()
+    )
+    df_decadal.to_csv(out_dir / "summary_decadal.csv", index=False, encoding="utf-8")
+
+    df_out = df[[
+        "modelo","ssp","ano","annual_mwh","capacity_factor",
+        "baseline_mwh","baseline_cf","delta_mwh_pct","delta_cf_pct","rolling5_mwh"
+    ]].copy()
+    df_out.to_csv(out_dir / "summary_by_year.csv", index=False, encoding="utf-8")
+
+    if not make_plots:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print("[Aviso] Matplotlib indisponível. Gráficos pulados.", str(e))
+        return
+
+    plt.figure(figsize=(12, 5))
+    for ssp, g in df.groupby("ssp"):
+        plt.plot(g["ano"], g["annual_mwh"], marker="o", linewidth=1, label=str(ssp))
+        plt.plot(g["ano"], g["rolling5_mwh"], linestyle="--", linewidth=1, label=f"{ssp} (média 5a.)")
+    plt.title("Energia anual (MWh)")
+    plt.xlabel("Ano")
+    plt.ylabel("MWh")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncols=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(fig_dir / "serie_annual_mwh.png", dpi=140)
+    plt.close()
+
+    plt.figure(figsize=(12, 5))
+    for ssp, g in df.groupby("ssp"):
+        plt.plot(g["ano"], g["delta_mwh_pct"], marker="o", linewidth=1, label=str(ssp))
+    plt.axhline(0, linewidth=0.8)
+    plt.title("Anomalia de MWh vs baseline (1994–2014) do próprio grupo")
+    plt.xlabel("Ano")
+    plt.ylabel("Δ MWh (%)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fig_dir / "serie_delta_mwh_pct.png", dpi=140)
+    plt.close()
+
+# ======================================================================
+# ================================ CLI / PIPE ===========================
+# ======================================================================
+def _parse_years_arg(s: str) -> List[int]:
+    s = s.strip()
+    if ":" in s:
+        a, b = s.split(":", 1)
+        a = int(a.strip()); b = int(b.strip())
+        if b < a:
+            a, b = b, a
+        return list(range(a, b+1))
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return [int(p) for p in parts]
+
+def _log_path(ssp_subdir: str, year: int) -> Path:
+    return Path(LOG_DIR) / f"log_{ssp_subdir}_{year}.txt"
+
+def _log_is_ok(fp: Path) -> bool:
+    if not fp.exists():
+        return False
+    parsed = parse_log_file(fp)
+    if not parsed["ok"]:
+        return False
+    data = parsed.get("data") or {}
+    if data.get("erro"):
+        return False
+    return ("annual_mwh" in data) and (data.get("annual_mwh") is not None)
+
+def quick_check(years_sample: List[int], scenarios: List[str], report: Optional[Report] = None):
+    print("\n[QuickCheck] Verificando ERA5 base, NEX e PySAM...")
+
+    if report:
+        report.set("config", "CSV_ERA5_BASE", CSV_ERA5_BASE)
+        report.set("config", "NEX_DIR_ROOT", NEX_DIR_ROOT)
+        report.set("config", "OUT_ROOT", OUT_ROOT)
+        report.set("config", "LOG_DIR", LOG_DIR)
+        report.set("config", "OUT_RESULTS_CSV", OUT_RESULTS_CSV)
+        report.set("config", "OUT_CONSOLIDADO", OUT_CONSOLIDADO)
+        report.set("config", "ANALISE_DIR", ANALISE_DIR)
+        report.set("config", "CLIM_CACHE_PATH", CLIM_CACHE_PATH)
+
+    print("  CSV_ERA5_BASE:", CSV_ERA5_BASE)
+    try:
+        df = read_era5_base(CSV_ERA5_BASE, ERA5_BASE_YEAR)
+        print(f"  ERA5 base OK: ano={ERA5_BASE_YEAR} | linhas={len(df)} | cols={list(df.columns)}")
+        if report:
+            report.set("precheck", "era5_ok", True)
+            report.set("precheck", "era5_year", ERA5_BASE_YEAR)
+            report.set("precheck", "era5_rows", int(len(df)))
+            report.set("precheck", "era5_cols", list(df.columns))
+    except Exception as e:
+        print("  [ERRO] ERA5 base:", str(e))
+        if report:
+            report.set("precheck", "era5_ok", False)
+            report.set("precheck", "era5_error", str(e))
+
+    try:
+        _pysam_preflight()
+        print("  PySAM import OK.")
+        if report:
+            report.set("precheck", "pysam_ok", True)
+    except Exception as e:
+        print("  [ERRO] PySAM:", str(e))
+        if report:
+            report.set("precheck", "pysam_ok", False)
+            report.set("precheck", "pysam_error", str(e))
+
+    print("  NEX_DIR_ROOT:", Path(NEX_DIR_ROOT))
+    sample_lines: List[str] = []
+    for ssp in scenarios:
+        for y in years_sample:
+            for v in ["rsds","tas","sfcWind","hurs"]:
+                ssp_name = ssp if y >= 2015 else "historical"
+                base = Path(NEX_DIR_ROOT) / ssp_name
+                p = _find_first_existing(base, [
+                    f"{v}_day_{MODEL}_{ssp_name}_*_gn_{y}.nc",
+                    f"{v}_day_{MODEL}_{ssp_name}_*_gn_{y}_*.nc",
+                    f"{v}_day_{MODEL}_{ssp_name}_r1i1p1f1_gn_{y}.nc",
+                    f"{v}_day_{MODEL}_{ssp_name}_*_{y}.nc",
+                    f"{v}_day_{MODEL}_{ssp_name}_*_gn_{y}_v2.0.nc",
+                ])
+                line = f"{v} {ssp} {y} -> {'OK' if p else 'NADA'}"
+                print(" ", line)
+                sample_lines.append(line)
+    if report:
+        report.set("precheck", "nex_sample", sample_lines)
+
+    print("[QuickCheck] Concluído.\n")
+
+def run_pipeline(years: List[int], scenarios: List[str], force: bool = False,
+                 stop_on_error: bool = False, rebuild_clim: bool = False,
+                 write_final_report: bool = True) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(OUT_SAM_CSV_DIR, exist_ok=True)
+    os.makedirs(Path(OUT_RESULTS_CSV).parent, exist_ok=True)
+
+    report = Report(MODEL, years, scenarios, mode="full")
+    sample_years = sorted({min(years), max(years), 2023}) if years else [2023]
+    sample_years = [y for y in sample_years if y in YEARS_DEFAULT]
+    quick_check(sample_years[:3], scenarios, report=report)
+
+    results: List[dict] = []
+
+    def empty_row(modelo: str, ssp: str, ano: int) -> dict:
+        return {
+            "modelo": modelo,
+            "ssp": ssp,
+            "ano": ano,
+            "arquivo": "",
+            "annual_mwh": np.nan,
+            "capacity_factor": np.nan,
+            "ac_monthly_kwh": None,
+            "tempo_s": np.nan,
+            "erro": None,
+        }
+
+    scen_iter = tqdm(scenarios, desc="Cenários", leave=True) if HAS_TQDM else scenarios
+    for ssp in scen_iter:
+        year_iter = tqdm(years, desc=f"{MODEL} | {ssp}", leave=False) if HAS_TQDM else years
+        for year in year_iter:
+            if year < 2015 and ssp != scenarios[0]:
+                continue
+
+            out_subdir = "historical" if year < 2015 else ssp
+            log_fp = _log_path(out_subdir, year)
+
+            if (not force) and _log_is_ok(log_fp):
+                parsed = parse_log_file(log_fp)
+                d = parsed.get("data") or {}
+                row = empty_row(MODEL, out_subdir, year)
+                row.update({
+                    "arquivo": d.get("arquivo",""),
+                    "annual_mwh": d.get("annual_mwh", np.nan),
+                    "capacity_factor": d.get("capacity_factor", np.nan),
+                    "ac_monthly_kwh": d.get("ac_monthly_kwh", None),
+                    "tempo_s": d.get("tempo_s", np.nan),
+                    "erro": None,
+                })
+                row["status"] = "SKIP_LOG_OK"
+                results.append(row)
+                report.add_run({
+                    "ssp": out_subdir, "ano": int(year), "status": "SKIP_LOG_OK",
+                    "annual_mwh": row.get("annual_mwh"), "capacity_factor": row.get("capacity_factor"),
+                    "tempo_total_ano_s": None, "erro": None
+                })
+                continue
+
+            t_year0 = time.time()
+            row = empty_row(MODEL, out_subdir, year)
+            status = "OK"
+            val_stats: Dict[str, Any] = {}
+            try:
+                out_csv = morph_one_year(ssp, year, rebuild_clim=rebuild_clim, report=report)
+                val_stats = validate_sam_csv(out_csv)
+
+                res = run_sam_from_csv(out_csv)
+                row.update(res)
+                row["erro"] = None
+
+                with open(log_fp, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(row, indent=2, ensure_ascii=False))
+
+            except Exception as e:
+                msg = str(e)
+                status = "ERRO"
+                row["erro"] = msg
+                with open(log_fp, "w", encoding="utf-8") as f:
+                    f.write(f"ERRO: {msg}\n")
+                if stop_on_error:
+                    results.append(row)
+                    pd.DataFrame(results).to_csv(OUT_RESULTS_CSV, index=False, encoding="utf-8")
+                    report.add_run({"ssp": out_subdir, "ano": int(year), "status": "ERRO", "erro": msg})
+                    if write_final_report:
+                        try:
+                            dfc = consolidate_logs(MODEL, LOG_DIR, str(Path(OUT_SAM_CSV_DIR).parent), OUT_CONSOLIDADO)
+                            report.set("consolidation", "out_path", OUT_CONSOLIDADO)
+                            report.set("consolidation", "n_rows", int(len(dfc)))
+                        except Exception as e2:
+                            report.error(f"Falha ao consolidar durante stop_on_error: {e2}")
+                        out_rep = write_report(report)
+                        print("\n[RELATÓRIO] Salvo em:", out_rep)
+                    raise
+
+            row["tempo_total_ano_s"] = round(time.time() - t_year0, 2)
+            row["status"] = status
+            for k, v in (val_stats or {}).items():
+                row[f"val_{k}"] = v
+
+            results.append(row)
+            report.add_run({
+                "ssp": out_subdir,
+                "ano": int(year),
+                "status": status,
+                "annual_mwh": row.get("annual_mwh"),
+                "capacity_factor": row.get("capacity_factor"),
+                "tempo_total_ano_s": row.get("tempo_total_ano_s"),
+                "erro": row.get("erro"),
+                "val_ghi_p95": row.get("val_ghi_p95"),
+                "val_temp_mean": row.get("val_temp_mean"),
+                "val_wind_mean": row.get("val_wind_mean"),
+                "val_rh_mean": row.get("val_rh_mean"),
+            })
+
+    pd.DataFrame(results).to_csv(OUT_RESULTS_CSV, index=False, encoding="utf-8")
+    print("\nResumo salvo em:", OUT_RESULTS_CSV)
+    print("Logs em:", LOG_DIR)
+
+    dfc = consolidate_logs(MODEL, LOG_DIR, str(Path(OUT_SAM_CSV_DIR).parent), OUT_CONSOLIDADO)
+    print(f"Consolidado salvo em: {OUT_CONSOLIDADO} | Linhas: {len(dfc)}")
+
+    report.set("consolidation", "out_path", OUT_CONSOLIDADO)
+    report.set("consolidation", "n_rows", int(len(dfc)))
+    if "log_status" in dfc.columns:
+        sc = dfc["log_status"].astype(str).str.upper().value_counts().to_dict()
+        report.set("consolidation", "status_counts", sc)
+    if "ssp" in dfc.columns:
+        report.set("consolidation", "ssp_counts", dfc["ssp"].astype(str).value_counts().to_dict())
+
+    analyze_results(OUT_CONSOLIDADO, ANALISE_DIR, make_plots=bool(PLOT_RESULTS))
+    print("Análise em:", ANALISE_DIR)
+
+    try:
+        p_ana = Path(ANALISE_DIR)
+        report.set("analysis", "dir", str(p_ana))
+        if p_ana.exists():
+            files = [p.name for p in p_ana.glob("*.csv")]
+            figs = [p.name for p in (p_ana / "figs").glob("*.png")] if (p_ana / "figs").exists() else []
+            report.set("analysis", "files", sorted(files))
+            report.set("analysis", "figs", sorted(figs))
+    except Exception as e:
+        report.warn(f"Não consegui listar outputs de análise: {e}")
+
+    if write_final_report:
+        out_rep = write_report(report)
+        print("\n[RELATÓRIO] Salvo em:", out_rep)
+
+def run_test_mode() -> None:
+    years_test = [1994, 2019, 2023, 2054]
+    scenarios = SCENARIOS_DEFAULT[:1]
+    years_test = sorted({y for y in years_test if y in YEARS_DEFAULT})
+    print("[TEST MODE] Rodando anos:", years_test, "| cenários:", scenarios)
+    run_pipeline(years_test, scenarios, force=True, stop_on_error=True, rebuild_clim=False, write_final_report=True)
+
+def run_analyze_only(write_final_report: bool = True) -> None:
+    years = YEARS_DEFAULT
+    scenarios = SCENARIOS_DEFAULT
+    report = Report(MODEL, years, scenarios, mode="analyze")
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(Path(OUT_RESULTS_CSV).parent, exist_ok=True)
+
+    try:
+        quick_check([1994, 2019, 2023], scenarios, report=report)
+    except Exception as e:
+        report.warn(f"Pré-check não completou (modo analyze): {e}")
+
+    dfc = consolidate_logs(MODEL, LOG_DIR, str(Path(OUT_SAM_CSV_DIR).parent), OUT_CONSOLIDADO)
+    print(f"Consolidado salvo em: {OUT_CONSOLIDADO} | Linhas: {len(dfc)}")
+
+    report.set("consolidation", "out_path", OUT_CONSOLIDADO)
+    report.set("consolidation", "n_rows", int(len(dfc)))
+    if "log_status" in dfc.columns:
+        sc = dfc["log_status"].astype(str).str.upper().value_counts().to_dict()
+        report.set("consolidation", "status_counts", sc)
+    if "ssp" in dfc.columns:
+        report.set("consolidation", "ssp_counts", dfc["ssp"].astype(str).value_counts().to_dict())
+
+    analyze_results(OUT_CONSOLIDADO, ANALISE_DIR, make_plots=bool(PLOT_RESULTS))
+    print("Análise em:", ANALISE_DIR)
+
+    try:
+        p_ana = Path(ANALISE_DIR)
+        report.set("analysis", "dir", str(p_ana))
+        if p_ana.exists():
+            files = [p.name for p in p_ana.glob("*.csv")]
+            figs = [p.name for p in (p_ana / "figs").glob("*.png")] if (p_ana / "figs").exists() else []
+            report.set("analysis", "files", sorted(files))
+            report.set("analysis", "figs", sorted(figs))
+    except Exception as e:
+        report.warn(f"Não consegui listar outputs de análise: {e}")
+
+    if write_final_report:
+        out_rep = write_report(report)
+        print("\n[RELATÓRIO] Salvo em:", out_rep)
+
+def main():
+    parser = argparse.ArgumentParser(description="Pipeline SAM morph unificado (v4 com relatório).")
+    parser.add_argument("--mode", choices=["test", "full", "analyze"], default="full",
+                        help="test=roda poucos anos; full=roda pipeline; analyze=só consolida+analisa.")
+    parser.add_argument("--years", type=str, default=None,
+                        help="Ex: 1994:2054 (inclusive) ou 2020,2021,2022")
+    parser.add_argument("--scenarios", type=str, default=None,
+                        help="Ex: ssp245  |  ssp245,ssp585")
+    parser.add_argument("--force", action="store_true", help="Reprocessa mesmo se log OK já existir.")
+    parser.add_argument("--stop-on-error", action="store_true", help="Para no primeiro erro (útil em testes).")
+    parser.add_argument("--rebuild-clim", action="store_true", help="Ignora o cache de climatologia e recalcula.")
+    parser.add_argument("--no-report", action="store_true", help="Não gera relatório final.")
+    args = parser.parse_args()
+
+    if args.mode == "test":
+        run_test_mode()
+        return
+
+    if args.mode == "analyze":
+        run_analyze_only(write_final_report=not bool(args.no_report))
+        return
+
+    years = YEARS_DEFAULT if args.years is None else _parse_years_arg(args.years)
+    scenarios = SCENARIOS_DEFAULT
+    if args.scenarios:
+        scenarios = [s.strip() for s in args.scenarios.replace(" ", ",").split(",") if s.strip()]
+
+    run_pipeline(
+        years, scenarios,
+        force=bool(args.force),
+        stop_on_error=bool(args.stop_on_error),
+        rebuild_clim=bool(args.rebuild_clim),
+        write_final_report=not bool(args.no_report),
+    )
+
+if __name__ == "__main__":
+    xr.set_options(keep_attrs=True)
+    main()
 from __future__ import annotations
 
 import json
