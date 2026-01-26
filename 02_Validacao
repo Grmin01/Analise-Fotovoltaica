@@ -1,0 +1,390 @@
+# -*- coding: utf-8 -*-
+"""
+qa_validacao_minima_morph.py
+=========================================================
+Validação mínima "defensável" para os CSVs morphed do pipeline SAM.
+
+O que este script faz:
+1) Sanidade física interna (por arquivo e agregado):
+   - checa 8760 linhas, NaN, monotonia de DateTime e step de 1h
+   - checa GHI ≈ DNI + DHI (erro absoluto e relativo)
+   - checa faixas físicas (GHI/DNI/DHI/Temp/RH/Vento)
+   - estatísticas (min/max/p95/p99) + flags
+2) Sazonalidade (agregado):
+   - calcula médias mensais (GHI, Temp, RH, Vento) e salva CSV
+   - gera gráfico mensal simples (matplotlib)
+3) Validação externa simples (opcional):
+   - NASA POWER (sem chave): compara irradiação mensal (kWh/m²/dia)
+     com a série morphed (integrando GHI horário).
+   - Se estiver sem internet/requests, você pode comparar manualmente
+     exportando CRESESB/PVGIS e colocando em um CSV (modelo abaixo).
+
+Como usar:
+  python qa_validacao_minima_morph.py --input-dir "C:\\...\\SAM_CSV_MORPH\\ACCESS-CM2" --out-dir "C:\\...\\analise_QA"
+
+Exemplos:
+  python qa_validacao_minima_morph.py --input-dir "C:\\Users\\alexs\\clima_campos\\resultados\\SAM_MORPH\\SAM_CSV_MORPH\\ACCESS-CM2" ^
+     --out-dir "C:\\Users\\alexs\\clima_campos\\resultados\\SAM_MORPH\\qa_ACCESS-CM2" ^
+     --lat -21.7 --lon -41.3
+
+Requisitos:
+  pip install pandas numpy matplotlib requests
+  (requests é só para NASA POWER; o resto roda sem requests)
+
+Observações importantes:
+- Seus CSVs são horário em W/m² (GHI/DNI/DHI). Para comparar com NASA POWER
+  (kWh/m²/dia), este script integra GHI por dia e tira média por mês.
+- Isso é "mínimo defensável". Não substitui validação completa de DNI/DHI
+  via geometria solar (pvlib) — mas já segura banca.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_PLT = True
+except Exception:
+    HAS_PLT = False
+
+# -----------------------------
+# Helpers
+# -----------------------------
+REQ_COLS = ["DateTime","GHI","DNI","DHI","TempC","WindSpeed","RelHum"]
+
+def ensure_datetime(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="coerce")
+    if getattr(dt.dtype, "tz", None) is not None:
+        try:
+            dt = dt.dt.tz_convert(None)
+        except Exception:
+            dt = dt.dt.tz_localize(None)
+    if dt.isna().any():
+        raise ValueError(f"DateTime inválido em {int(dt.isna().sum())} linhas.")
+    return dt
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+def list_csvs(root: Path) -> List[Path]:
+    # espera estrutura: root/{historical|ssp245|ssp585}/SAM_*_morph.csv
+    out = []
+    if not root.exists():
+        return out
+    for fp in root.rglob("SAM_*_morph.csv"):
+        out.append(fp)
+    return sorted(out)
+
+def load_csv(fp: Path) -> pd.DataFrame:
+    df = pd.read_csv(fp)
+    missing = [c for c in REQ_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"{fp.name}: faltam colunas {missing}")
+    df["DateTime"] = ensure_datetime(df["DateTime"]).dt.floor("h")
+    for c in REQ_COLS[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+# -----------------------------
+# Checks internos
+# -----------------------------
+def check_internal(df: pd.DataFrame) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+
+    # 8760
+    out["n_rows"] = int(len(df))
+
+    # NaN
+    out["n_nan"] = int(df[REQ_COLS].isna().sum().sum())
+
+    # step horário (esperado 1h)
+    dt = df["DateTime"].sort_values()
+    dsec = dt.diff().dt.total_seconds().dropna()
+    out["pct_step_3600s"] = float((dsec == 3600).mean() * 100.0) if len(dsec) else np.nan
+
+    # GHI ≈ DNI + DHI
+    s = df["GHI"] - (df["DNI"] + df["DHI"])
+    out["ghi_balance_mae"] = float(np.nanmean(np.abs(s)))
+    # erro relativo só quando GHI>50 W/m² (evita noite)
+    mask = df["GHI"] > 50
+    denom = df.loc[mask, "GHI"].replace(0, np.nan)
+    rel = (np.abs(s[mask]) / denom) if mask.any() else pd.Series(dtype=float)
+    out["ghi_balance_mape_pct"] = float(np.nanmean(rel) * 100.0) if len(rel) else np.nan
+
+    # Faixas físicas simples
+    out["ghi_min"] = safe_float(df["GHI"].min())
+    out["ghi_max"] = safe_float(df["GHI"].max())
+    out["ghi_p95"] = safe_float(df["GHI"].quantile(0.95))
+    out["ghi_p99"] = safe_float(df["GHI"].quantile(0.99))
+
+    out["temp_min"] = safe_float(df["TempC"].min())
+    out["temp_max"] = safe_float(df["TempC"].max())
+    out["rh_min"]   = safe_float(df["RelHum"].min())
+    out["rh_max"]   = safe_float(df["RelHum"].max())
+    out["wspd_min"] = safe_float(df["WindSpeed"].min())
+    out["wspd_max"] = safe_float(df["WindSpeed"].max())
+
+    # Flags (% de valores "suspeitos")
+    out["pct_ghi_neg"] = float((df["GHI"] < -1e-6).mean() * 100.0)
+    out["pct_dni_neg"] = float((df["DNI"] < -1e-6).mean() * 100.0)
+    out["pct_dhi_neg"] = float((df["DHI"] < -1e-6).mean() * 100.0)
+
+    out["pct_rh_out_0_100"] = float(((df["RelHum"] < 0) | (df["RelHum"] > 100)).mean() * 100.0)
+    out["pct_wspd_neg"] = float((df["WindSpeed"] < -1e-6).mean() * 100.0)
+
+    # pico "alto" de GHI como alerta (não é erro por si, só bandeira)
+    out["flag_ghi_max_gt_1300"] = float(df["GHI"].max() > 1300)
+    out["flag_temp_lt_0"] = float(df["TempC"].min() < 0)
+    out["flag_temp_gt_45"] = float(df["TempC"].max() > 45)
+
+    return out
+
+def monthly_means(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["month"] = d["DateTime"].dt.month.astype(int)
+    g = d.groupby("month")[["GHI","TempC","RelHum","WindSpeed"]].mean().reset_index()
+    return g
+
+def monthly_kwh_m2_day_from_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converte GHI horário (W/m²) -> irradiação diária (kWh/m²/dia)
+    e tira a média por mês.
+    """
+    d = df.copy()
+    d["date"] = d["DateTime"].dt.date
+    d["month"] = d["DateTime"].dt.month.astype(int)
+
+    # energia diária: soma de W/m² * 1h = Wh/m²; divide por 1000 => kWh/m²/dia
+    daily = d.groupby(["month","date"])["GHI"].sum().reset_index()
+    daily["kwh_m2_day"] = daily["GHI"] / 1000.0
+    out = daily.groupby("month")["kwh_m2_day"].mean().reset_index()
+    return out
+
+# -----------------------------
+# NASA POWER (opcional)
+# -----------------------------
+def fetch_nasa_power_monthly(lat: float, lon: float, start: int, end: int) -> pd.DataFrame:
+    """
+    NASA POWER: ALLSKY_SFC_SW_DWN é irradiação média diária (kWh/m²/dia).
+    Retorna média mensal (1..12) agregada no período [start, end].
+    """
+    try:
+        import requests
+    except Exception as e:
+        raise RuntimeError("requests não instalado; instale com: pip install requests") from e
+
+    # endpoint "temporal/monthly" - community: "RE"
+    # docs: https://power.larc.nasa.gov/docs/services/api/
+    url = "https://power.larc.nasa.gov/api/temporal/monthly/point"
+    params = {
+        "parameters": "ALLSKY_SFC_SW_DWN",
+        "community": "RE",
+        "longitude": lon,
+        "latitude": lat,
+        "start": str(start),
+        "end": str(end),
+        "format": "JSON",
+    }
+    r = requests.get(url, params=params, timeout=60)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]  # dict YYYYMM -> val
+    rows = []
+    for yyyymm, val in data.items():
+        if val is None:
+            continue
+        yyyy = int(yyyymm[:4]); mm = int(yyyymm[4:6])
+        if yyyy < start or yyyy > end:
+            continue
+        rows.append((mm, float(val)))
+    if not rows:
+        raise RuntimeError("NASA POWER retornou vazio; verifique coordenadas/período.")
+
+    df = pd.DataFrame(rows, columns=["month","nasa_kwh_m2_day"])
+    out = df.groupby("month")["nasa_kwh_m2_day"].mean().reset_index()
+    out["month"] = out["month"].astype(int)
+    return out.sort_values("month")
+
+# -----------------------------
+# Relatório
+# -----------------------------
+def write_report_md(out_dir: Path,
+                    internal_df: pd.DataFrame,
+                    agg_monthly: pd.DataFrame,
+                    ext_compare: Optional[pd.DataFrame],
+                    notes: List[str]) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fp = out_dir / "relatorio_validacao_minima.md"
+
+    def df_to_md(df: pd.DataFrame, n=30) -> str:
+        return df.head(n).to_markdown(index=False)
+
+    lines: List[str] = []
+    lines.append("# Validação mínima – CSVs morphed (SAM)\n")
+    lines.append("## 1) Sanidade física interna (por arquivo)\n")
+    lines.append("**O que foi checado:** 8760 linhas, NaN, passo horário 1h, balanço `GHI ≈ DNI + DHI`, faixas físicas.\n")
+    lines.append(df_to_md(internal_df))
+    lines.append("\n")
+    lines.append("### Interpretação rápida\n")
+    lines.append("- `ghi_balance_mae` próximo de 0 e `ghi_balance_mape_pct` baixo (≲1%) indicam consistência interna entre GHI/DNI/DHI.\n")
+    lines.append("- `pct_step_3600s` deve ficar ~100%. Se for baixo, há problemas de DateTime.\n")
+    lines.append("- `flag_ghi_max_gt_1300=1` é *alerta* (não prova erro), pede checagem de picos.\n")
+
+    lines.append("\n## 2) Sazonalidade (média mensal agregada)\n")
+    lines.append(df_to_md(agg_monthly, n=12))
+    lines.append("\n")
+    if HAS_PLT:
+        lines.append("Gráfico mensal salvo em: `fig_sazonalidade_mensal.png`.\n")
+    else:
+        lines.append("Matplotlib não disponível; gráfico não foi gerado.\n")
+
+    lines.append("\n## 3) Validação externa simples (NASA POWER) – opcional\n")
+    if ext_compare is None:
+        lines.append("Sem comparação externa (NASA POWER não executado ou falhou).\n")
+    else:
+        lines.append(df_to_md(ext_compare, n=12))
+        lines.append("\n**Resumo:**\n")
+        if "abs_diff_pct" in ext_compare.columns:
+            mean_abs = float(ext_compare["abs_diff_pct"].mean())
+            lines.append(f"- Diferença absoluta média (|%|) por mês: **{mean_abs:.1f}%**\n")
+
+    lines.append("\n## 4) Nota metodológica (para a dissertação)\n")
+    lines.append(
+        "A série horária foi gerada por técnica de *delta change* mensal aplicada a um ano-base horário (ERA5). "
+        "Assim, a forma intradiária do ano-base é preservada e os níveis mensais são ajustados conforme o modelo climático. "
+        "Logo, inferências de tendência são mais robustas em médias mensais/anuais do que em extremos horários.\n"
+    )
+
+    if notes:
+        lines.append("\n## 5) Observações\n")
+        for n in notes:
+            lines.append(f"- {n}\n")
+
+    fp.write_text("\n".join(lines), encoding="utf-8")
+    return fp
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input-dir", required=True, help="Pasta raiz do modelo (contendo subpastas historical/ssp...).")
+    ap.add_argument("--out-dir", required=True, help="Pasta de saída do QA.")
+    ap.add_argument("--lat", type=float, default=-21.7)
+    ap.add_argument("--lon", type=float, default=-41.3)
+    ap.add_argument("--external", choices=["none","nasa"], default="nasa",
+                    help="Comparação externa: none ou nasa (NASA POWER).")
+    ap.add_argument("--years", type=str, default=None,
+                    help="Período para NASA POWER (ex: 1994:2014). Default: tenta inferir do conjunto.")
+    ap.add_argument("--max-files", type=int, default=0,
+                    help="0=processa tudo; >0 limita o número de arquivos (para rodar rápido).")
+    args = ap.parse_args()
+
+    root = Path(args.input_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    files = list_csvs(root)
+    if not files:
+        raise SystemExit(f"Nenhum CSV encontrado em: {root}")
+
+    if args.max_files and args.max_files > 0:
+        files = files[:args.max_files]
+
+    rows = []
+    monthly_all = []
+
+    notes = []
+    inferred_years = []
+
+    for fp in files:
+        df = load_csv(fp)
+        # infer years
+        inferred_years.extend(df["DateTime"].dt.year.unique().tolist())
+
+        ck = check_internal(df)
+        ck["file"] = str(fp)
+        # tags úteis (ssp/ano)
+        # tenta extrair do nome SAM_MODEL_ssp_YYYY_morph.csv
+        name = fp.name
+        parts = name.split("_")
+        # fallback simples
+        ck["tag_ssp"] = fp.parent.name
+        try:
+            ck["tag_year"] = int(parts[-2]) if parts[-1].endswith("morph.csv") else np.nan
+        except Exception:
+            ck["tag_year"] = np.nan
+
+        rows.append(ck)
+
+        m = monthly_means(df)
+        m["file"] = str(fp)
+        m["tag_ssp"] = ck["tag_ssp"]
+        m["tag_year"] = ck["tag_year"]
+        monthly_all.append(m)
+
+    internal_df = pd.DataFrame(rows)
+    internal_df.to_csv(out_dir / "qa_interno_por_arquivo.csv", index=False, encoding="utf-8-sig")
+
+    monthly_all_df = pd.concat(monthly_all, ignore_index=True)
+    monthly_all_df.to_csv(out_dir / "medias_mensais_por_arquivo.csv", index=False, encoding="utf-8-sig")
+
+    # agregado: média mensal de todos os arquivos (por mês)
+    agg = monthly_all_df.groupby("month")[["GHI","TempC","RelHum","WindSpeed"]].mean().reset_index()
+    agg.to_csv(out_dir / "medias_mensais_agregado.csv", index=False, encoding="utf-8-sig")
+
+    # gráfico simples
+    if HAS_PLT:
+        fig_path = out_dir / "fig_sazonalidade_mensal.png"
+        plt.figure(figsize=(10,5))
+        plt.plot(agg["month"], agg["GHI"], marker="o", label="GHI (W/m², média horária do mês)")
+        plt.plot(agg["month"], agg["TempC"], marker="o", label="TempC (°C)")
+        plt.plot(agg["month"], agg["RelHum"], marker="o", label="RH (%)")
+        plt.plot(agg["month"], agg["WindSpeed"], marker="o", label="Vento (m/s)")
+        plt.xticks(range(1,13))
+        plt.grid(True, alpha=0.3)
+        plt.title("Sazonalidade – médias mensais agregadas (todos os arquivos analisados)")
+        plt.xlabel("Mês")
+        plt.legend(fontsize=8, ncols=2)
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=160)
+        plt.close()
+
+    # Validação externa NASA POWER (opcional)
+    ext_compare = None
+    if args.external == "nasa":
+        # escolhe período
+        y0 = min(inferred_years) if inferred_years else 1994
+        y1 = max(inferred_years) if inferred_years else 2014
+        if args.years and ":" in args.years:
+            a,b = args.years.split(":",1)
+            y0 = int(a.strip()); y1 = int(b.strip())
+        # usa um único arquivo representativo para o cálculo mensal de kWh/m2/dia
+        # (se você quiser, pode ajustar para comparar por cenário/ano)
+        try:
+            # pega o primeiro arquivo como referência
+            df0 = load_csv(files[0])
+            morph_kwh = monthly_kwh_m2_day_from_hourly(df0).rename(columns={"kwh_m2_day":"morph_kwh_m2_day"})
+            nasa = fetch_nasa_power_monthly(args.lat, args.lon, y0, y1)
+            ext_compare = morph_kwh.merge(nasa, on="month", how="inner")
+            ext_compare["diff_pct"] = 100.0 * (ext_compare["morph_kwh_m2_day"] - ext_compare["nasa_kwh_m2_day"]) / ext_compare["nasa_kwh_m2_day"]
+            ext_compare["abs_diff_pct"] = ext_compare["diff_pct"].abs()
+            ext_compare.to_csv(out_dir / "comparacao_nasa_power.csv", index=False, encoding="utf-8-sig")
+        except Exception as e:
+            notes.append(f"NASA POWER não executou: {e}")
+
+    report_fp = write_report_md(out_dir, internal_df, agg, ext_compare, notes)
+    print("[OK] Relatório salvo em:", report_fp)
+    print("[OK] Saídas em:", out_dir)
+
+if __name__ == "__main__":
+    main()
