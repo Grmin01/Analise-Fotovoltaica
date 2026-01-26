@@ -1,0 +1,1106 @@
+from __future__ import annotations
+
+import json
+import math
+import re
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# ========================= CONFIG (AJUSTE AQUI) =========================
+MODEL = "ACCESS-CM2"
+SCENARIOS = ["historical", "ssp245", "ssp585"]
+
+# Onde salvar tabelas e figuras (dissertação)
+OUT_DIR = Path(r"C:\Users\alexs\clima_campos\05_RESULTADOS")
+
+# Onde estão os CSVs morfados (fonte principal)
+MORPHED_CSV_ROOT = Path(rf"C:\Users\alexs\clima_campos\resultados\SAM_MORPH\SAM_CSV_MORPH\{MODEL}")
+
+# Onde estão os logs (se existirem). Usado para reaproveitar annual_mwh/cf e mensal
+LOG_DIR = Path(rf"C:\Users\alexs\clima_campos\resultados\SAM_MORPH\logs_sam_morph_{MODEL}")
+
+# Se faltar resultado no log, roda PySAM no CSV morfado
+RUN_PYSAM_IF_MISSING = True
+
+# Se rodar PySAM, salva/atualiza logs JSON correspondentes (recomendado)
+WRITE_LOGS_IF_RUN = True
+
+# Baseline preferido (dissertação)
+BASELINE_YEARS = list(range(1994, 2015))  # 1994–2014
+FUTURE_START_YEAR = 2015
+ROLL_WIN = 5
+DPI = 180
+
+# Paleta fria (azul claro -> azul escuro quase preto)
+# - usada como ciclo de cores para linhas/markers
+# - e também para colormap do heatmap
+BLUE_CYCLE = ["#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c", "#08306b"]
+BLUE_CMAP_COLORS = ["#eaf2fb", "#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c", "#08306b", "#001021"]
+
+# Parâmetros do PVWatts (DEVEM casar com o pipeline, se quiser consistência)
+LAT, LON, ELEV, TZ = -21.7, -41.3, 20, -3
+SYSTEM_CAP_KW = 1000.0
+TILT_DEG = 21.5
+AZIMUTH_DEG = 0.0
+DC_AC_RATIO = 1.2
+LOSSES_PCT = 14.0
+INVERTER_EFF = 96.0
+MODULE_TYPE = 0
+ARRAY_TYPE = 0
+GCR = 0.40
+
+# =======================================================================
+
+TABLE_DIR = OUT_DIR / "TABELAS_FV"
+FIG_DIR = OUT_DIR / "GRAFICOS_FV"
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+TABLE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------- Helpers gerais ------------------------------
+def _decade_of(y: int) -> str:
+    return f"{(y // 10) * 10}s"
+
+
+def _rolling(s: pd.Series, win: int = ROLL_WIN) -> pd.Series:
+    return s.rolling(win, min_periods=max(1, win // 2)).mean()
+
+
+def _ols_fit(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """y = a*x + b"""
+    a, b = np.polyfit(x.astype(float), y.astype(float), 1)
+    return float(a), float(b)
+
+
+def _safe_pct(a: float, b: float) -> float:
+    if b is None or not np.isfinite(b) or b == 0:
+        return float("nan")
+    return 100.0 * (a - b) / b
+
+
+def _save_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _try_import_matplotlib():
+    try:
+        import matplotlib.pyplot as plt  # noqa
+        return plt
+    except Exception:
+        print("[ERRO] Matplotlib não disponível. Instale com: pip install matplotlib")
+        raise
+
+
+def _apply_plot_style(plt):
+    """
+    Aplica paleta fria a TODOS os gráficos via rcParams/ciclo de cores
+    e devolve um colormap para heatmaps.
+    """
+    from cycler import cycler
+    from matplotlib.colors import LinearSegmentedColormap
+
+    plt.rcParams["axes.prop_cycle"] = cycler(color=BLUE_CYCLE)
+    plt.rcParams["grid.alpha"] = 0.25
+    plt.rcParams["axes.grid"] = True
+    plt.rcParams["axes.axisbelow"] = True
+    plt.rcParams["savefig.facecolor"] = "white"
+
+    cmap = LinearSegmentedColormap.from_list("cold_blues", BLUE_CMAP_COLORS)
+    return cmap
+
+
+def ensure_datetime(series: pd.Series) -> pd.Series:
+    s = pd.to_datetime(series, errors="coerce", utc=False)
+    if getattr(s.dtype, "tz", None) is not None:
+        try:
+            s = s.dt.tz_convert(None)
+        except Exception:
+            s = s.dt.tz_localize(None)
+    if s.isna().any():
+        raise ValueError(f"Falha ao converter DateTime: {int(s.isna().sum())} linhas inválidas.")
+    return s
+
+
+# ------------------------- Descoberta de arquivos ----------------------
+def discover_morphed_csvs(root: Path) -> pd.DataFrame:
+    """
+    Varre:
+      root/historical/*.csv
+      root/ssp245/*.csv
+      root/ssp585/*.csv
+
+    Retorna DF: ssp, ano, path
+    """
+    rows = []
+    for ssp in SCENARIOS:
+        d = root / ssp
+        if not d.exists():
+            continue
+        for fp in sorted(d.glob("*.csv")):
+            m = re.search(r"_(historical|ssp245|ssp585)_(\d{4})_morph\.csv$", fp.name)
+            if not m:
+                continue
+            rows.append({"ssp": m.group(1), "ano": int(m.group(2)), "path": str(fp)})
+    return pd.DataFrame(rows).sort_values(["ssp", "ano"]).reset_index(drop=True)
+
+
+# ------------------------- Logs: leitura/parse -------------------------
+def _parse_log_json(path: Path) -> Optional[dict]:
+    try:
+        txt = path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return None
+    # JSON direto
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+    # JSON dentro do texto
+    try:
+        m = re.search(r"\{.*\}", txt, flags=re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        return None
+    return None
+
+
+def log_path(ssp: str, ano: int) -> Path:
+    return LOG_DIR / f"log_{ssp}_{ano}.txt"
+
+
+# ------------------------- PySAM runner (se faltar) --------------------
+def _pysam_preflight() -> None:
+    try:
+        import PySAM.Pvwattsv8 as Pvwattsv8  # noqa: F401
+    except Exception as e:
+        raise RuntimeError(
+            "Falha ao importar PySAM.Pvwattsv8. "
+            "Instale NREL-PySAM no mesmo .venv. "
+            f"Erro original: {e}"
+        )
+
+
+def df_to_solar_resource(df: pd.DataFrame) -> dict:
+    dt = df["DateTime"]
+    return {
+        "lat": LAT, "lon": LON, "elev": ELEV, "tz": TZ,
+        "year": dt.dt.year.tolist(),
+        "month": dt.dt.month.tolist(),
+        "day": dt.dt.day.tolist(),
+        "hour": dt.dt.hour.tolist(),
+        "minute": [0] * len(df),
+        "gh": df["GHI"].astype(float).tolist(),
+        "dn": df["DNI"].astype(float).tolist(),
+        "df": df["DHI"].astype(float).tolist(),
+        "tdry": df["TempC"].astype(float).tolist(),
+        "wspd": df["WindSpeed"].astype(float).tolist(),
+        "rh": df["RelHum"].astype(float).tolist(),
+    }
+
+
+def run_pysam_from_morphed_csv(csv_path: str) -> dict:
+    import PySAM.Pvwattsv8 as Pvwattsv8
+
+    df = pd.read_csv(csv_path)
+    if "DateTime" not in df.columns:
+        raise ValueError(f"CSV sem DateTime: {csv_path}")
+
+    df["DateTime"] = ensure_datetime(df["DateTime"]).dt.floor("h")
+
+    req = ["GHI", "DNI", "DHI", "TempC", "WindSpeed", "RelHum"]
+    for c in req:
+        if c not in df.columns:
+            raise ValueError(f"CSV morfado sem coluna {c}: {csv_path}")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if df[req].isna().any().any():
+        raise ValueError(f"CSV morfado com NaN em colunas meteorológicas: {csv_path}")
+
+    # remove feb 29 se necessário
+    if len(df) == 8784:
+        df = df.loc[~((df["DateTime"].dt.month == 2) & (df["DateTime"].dt.day == 29))].copy()
+
+    if len(df) != 8760:
+        raise ValueError(f"CSV morfado não tem 8760 linhas (tem {len(df)}): {csv_path}")
+
+    m = Pvwattsv8.new()
+    m.SystemDesign.system_capacity = SYSTEM_CAP_KW
+    m.SystemDesign.module_type = MODULE_TYPE
+    m.SystemDesign.array_type = ARRAY_TYPE
+    m.SystemDesign.tilt = TILT_DEG
+    m.SystemDesign.azimuth = AZIMUTH_DEG
+    m.SystemDesign.gcr = GCR
+    m.SystemDesign.dc_ac_ratio = DC_AC_RATIO
+    m.SystemDesign.inv_eff = INVERTER_EFF
+    m.SystemDesign.losses = LOSSES_PCT
+
+    m.SolarResource.solar_resource_data = df_to_solar_resource(df)
+
+    t0 = time.time()
+    m.execute()
+    elapsed = time.time() - t0
+
+    annual_kwh = float(m.Outputs.annual_energy)
+    return {
+        "arquivo_csv": Path(csv_path).name,
+        "annual_mwh": round(annual_kwh / 1000.0, 3),
+        "capacity_factor": float(m.Outputs.capacity_factor) / 100.0,
+        "ac_monthly_kwh": [float(x) for x in m.Outputs.ac_monthly],
+        "tempo_s": round(elapsed, 2),
+        "erro": None,
+    }
+
+
+# ------------------------- Reconstrução anual --------------------------
+def build_results_from_existing(morphed_index: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Retorna:
+      df_year: modelo, ssp, ano, annual_mwh, capacity_factor, fonte, caminho_csv, log_arquivo
+      df_month: ssp, ano, mes, ac_kwh, fonte
+    """
+    _pysam_preflight()
+
+    rows_year = []
+    rows_month = []
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    for _, r in morphed_index.iterrows():
+        ssp = str(r["ssp"])
+        ano = int(r["ano"])
+        csv_path = str(r["path"])
+        lp = log_path(ssp, ano)
+
+        used = None
+        log_data = _parse_log_json(lp) if lp.exists() else None
+
+        # 1) tenta log
+        if isinstance(log_data, dict) and (log_data.get("erro") is None) and (log_data.get("annual_mwh") is not None):
+            annual_mwh = float(log_data.get("annual_mwh"))
+            cf = float(log_data.get("capacity_factor")) if log_data.get("capacity_factor") is not None else float("nan")
+            arr = log_data.get("ac_monthly_kwh")
+            used = "log"
+        else:
+            annual_mwh, cf, arr = None, None, None
+
+        # 2) roda pysam se precisar
+        if (annual_mwh is None or not np.isfinite(annual_mwh)) and RUN_PYSAM_IF_MISSING:
+            res = run_pysam_from_morphed_csv(csv_path)
+            annual_mwh = float(res["annual_mwh"])
+            cf = float(res["capacity_factor"])
+            arr = res.get("ac_monthly_kwh")
+            used = "pysam"
+
+            if WRITE_LOGS_IF_RUN:
+                payload = {
+                    "modelo": MODEL,
+                    "ssp": ssp,
+                    "ano": ano,
+                    "annual_mwh": annual_mwh,
+                    "capacity_factor": cf,
+                    "ac_monthly_kwh": arr,
+                    "tempo_s": res.get("tempo_s"),
+                    "arquivo": res.get("arquivo_csv"),
+                    "erro": None,
+                }
+                lp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        if annual_mwh is None or not np.isfinite(annual_mwh):
+            continue
+
+        rows_year.append(
+            {
+                "modelo": MODEL,
+                "ssp": ssp,
+                "ano": ano,
+                "annual_mwh": float(annual_mwh),
+                "capacity_factor": float(cf) if cf is not None else float("nan"),
+                "fonte": used or "desconhecido",
+                "caminho_csv": csv_path,
+                "log_arquivo": str(lp) if lp.exists() else "",
+            }
+        )
+
+        # mensal (se tiver)
+        if isinstance(arr, list) and len(arr) == 12:
+            for mes, val in enumerate(arr, start=1):
+                try:
+                    rows_month.append({"ssp": ssp, "ano": ano, "mes": mes, "ac_kwh": float(val), "fonte": used or "desconhecido"})
+                except Exception:
+                    pass
+
+    df_year = pd.DataFrame(rows_year).sort_values(["ssp", "ano"]).reset_index(drop=True)
+    df_month = pd.DataFrame(rows_month).sort_values(["ssp", "ano", "mes"]).reset_index(drop=True)
+    return df_year, df_month
+
+
+# --------------------- Série "composta" por cenário --------------------
+def build_composed(df: pd.DataFrame, scenario: str) -> pd.DataFrame:
+    """
+    Para 'ssp245'/'ssp585':
+      anos < 2015 = historical (se existir)
+      anos >= 2015 = scenario
+    Para 'historical': retorna ele mesmo.
+    """
+    if scenario == "historical":
+        out = df[df["ssp"] == "historical"].copy()
+        out["scenario_comp"] = "historical"
+        return out
+
+    hist = df[df["ssp"] == "historical"].copy()
+    fut = df[df["ssp"] == scenario].copy()
+
+    hist = hist[hist["ano"] < FUTURE_START_YEAR]
+    fut = fut[fut["ano"] >= FUTURE_START_YEAR]
+
+    out = pd.concat([hist, fut], axis=0, ignore_index=True)
+    out = out.sort_values("ano").reset_index(drop=True)
+    out["scenario_comp"] = scenario
+    return out
+
+
+# --------------------- Baseline robusto --------------------------------
+def choose_baseline_annual(df: pd.DataFrame, baseline_years: List[int]) -> Tuple[pd.DataFrame, str]:
+    df = df.dropna(subset=["ano", "annual_mwh", "capacity_factor"]).copy()
+    if df.empty:
+        return df, "SEM_DADOS"
+
+    hist = df[df["ssp"] == "historical"].copy()
+    base_set = set(baseline_years)
+
+    if not hist.empty:
+        h1 = hist[hist["ano"].isin(base_set)].copy()
+        if not h1.empty:
+            return h1, f"historical {min(h1['ano'])}–{max(h1['ano'])} (preferido)"
+        return hist, f"historical {min(hist['ano'])}–{max(hist['ano'])} (fallback: histórico disponível)"
+
+    d1 = df[df["ano"].isin(base_set)].copy()
+    if not d1.empty:
+        return d1, f"anos {min(d1['ano'])}–{max(d1['ano'])} (fallback: sem historical)"
+
+    years_avail = sorted(df["ano"].unique().tolist())
+    n = max(3, len(baseline_years)) if baseline_years else 20
+    start = years_avail[0]
+    target = list(range(start, start + n))
+    d2 = df[df["ano"].isin(target)].copy()
+    if d2.empty:
+        return df, f"todos os anos disponíveis {min(df['ano'])}–{max(df['ano'])} (fallback final)"
+    return d2, f"primeiros {n} anos disponíveis: {min(d2['ano'])}–{max(d2['ano'])} (fallback)"
+
+
+def choose_baseline_monthly(dfm: pd.DataFrame, baseline_years: List[int]) -> Tuple[pd.Series, str]:
+    if dfm.empty:
+        return pd.Series(dtype=float), "SEM_LOGS"
+
+    base_set = set(baseline_years)
+    hist = dfm[dfm["ssp"] == "historical"].copy()
+
+    if not hist.empty:
+        h1 = hist[hist["ano"].isin(base_set)].copy()
+        if not h1.empty:
+            return h1.groupby("mes")["ac_kwh"].mean(), f"mensal historical {min(h1['ano'])}–{max(h1['ano'])} (preferido)"
+        return hist.groupby("mes")["ac_kwh"].mean(), f"mensal historical {min(hist['ano'])}–{max(hist['ano'])} (fallback)"
+
+    d1 = dfm[dfm["ano"].isin(base_set)].copy()
+    if not d1.empty:
+        return d1.groupby("mes")["ac_kwh"].mean(), f"mensal anos {min(d1['ano'])}–{max(d1['ano'])} (fallback: sem historical)"
+
+    years_avail = sorted(dfm["ano"].unique().tolist())
+    n = max(3, len(baseline_years)) if baseline_years else 20
+    start = years_avail[0]
+    target = list(range(start, start + n))
+    d2 = dfm[dfm["ano"].isin(target)].copy()
+    if d2.empty:
+        return dfm.groupby("mes")["ac_kwh"].mean(), f"mensal todos anos {min(dfm['ano'])}–{max(dfm['ano'])} (fallback final)"
+    return d2.groupby("mes")["ac_kwh"].mean(), f"mensal primeiros {n} anos {min(d2['ano'])}–{max(d2['ano'])} (fallback)"
+
+
+# ----------------------------- Pettitt --------------------------------
+def pettitt_test(series: pd.Series) -> Dict[str, float]:
+    x = np.asarray(series.dropna().values, dtype=float)
+    n = len(x)
+    if n < 5:
+        return {"k": float("nan"), "K": float("nan"), "p": float("nan")}
+
+    r = pd.Series(x).rank().values
+    U = np.zeros(n)
+    for t in range(n):
+        U[t] = 2 * np.sum(r[: t + 1]) - (t + 1) * (n + 1)
+    K = float(np.max(np.abs(U)))
+    k = int(np.argmax(np.abs(U)))
+
+    p = 2.0 * math.exp((-6.0 * (K ** 2)) / (n ** 3 + n ** 2))
+    p = float(min(max(p, 0.0), 1.0))
+    return {"k": float(k), "K": float(K), "p": p}
+
+
+# ---------------------------- Estatísticas -----------------------------
+def table16_descriptive(df_comp: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows = []
+    for scen, d in df_comp.items():
+        s = d.dropna(subset=["annual_mwh", "capacity_factor"]).copy()
+        if s.empty:
+            continue
+
+        def stats(v: pd.Series) -> Dict[str, float]:
+            v = v.dropna().astype(float)
+            return {
+                "n": int(v.count()),
+                "mean": float(v.mean()),
+                "std": float(v.std(ddof=1)) if v.count() > 1 else float("nan"),
+                "min": float(v.min()),
+                "p25": float(v.quantile(0.25)),
+                "median": float(v.quantile(0.50)),
+                "p75": float(v.quantile(0.75)),
+                "max": float(v.max()),
+            }
+
+        st_mwh = stats(s["annual_mwh"])
+        st_cf = stats(s["capacity_factor"])
+
+        rows.append(
+            {
+                "cenario": scen,
+                **{f"mwh_{k}": v for k, v in st_mwh.items()},
+                **{f"cf_{k}": v for k, v in st_cf.items()},
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ------------------------------ Plotters -------------------------------
+def _savefig(plt, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(path, dpi=DPI)
+    plt.close()
+
+
+def plot_time_series_mwh(plt, df: pd.DataFrame, title: str, out_png: Path, add_roll=True, add_trend=True):
+    d = df.dropna(subset=["ano", "annual_mwh"]).copy()
+    if d.empty:
+        return
+    x = d["ano"].astype(int).values
+    y = d["annual_mwh"].astype(float).values
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, y, marker="o", linewidth=1, label="Annual MWh")
+    if add_roll:
+        rr = _rolling(pd.Series(y, index=x), win=ROLL_WIN)
+        plt.plot(rr.index.values, rr.values, linestyle="--", linewidth=1, label=f"Média móvel {ROLL_WIN}a")
+    if add_trend and len(x) >= 3:
+        a, b = _ols_fit(x, y)
+        yhat = a * x + b
+        plt.plot(x, yhat, linestyle=":", linewidth=2, label="Tendência OLS")
+    plt.xlabel("Ano")
+    plt.ylabel("MWh")
+    plt.legend()
+    _savefig(plt, out_png)
+
+
+def plot_time_series_cf(plt, df: pd.DataFrame, title: str, out_png: Path, add_trend=True):
+    d = df.dropna(subset=["ano", "capacity_factor"]).copy()
+    if d.empty:
+        return
+    x = d["ano"].astype(int).values
+    y = d["capacity_factor"].astype(float).values
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, y, marker="o", linewidth=1, label="CF (fração)")
+    if add_trend and len(x) >= 3:
+        a, b = _ols_fit(x, y)
+        yhat = a * x + b
+        plt.plot(x, yhat, linestyle=":", linewidth=2, label="Tendência OLS")
+    plt.xlabel("Ano")
+    plt.ylabel("CF")
+    plt.legend()
+    _savefig(plt, out_png)
+
+
+def plot_scatter_mwh_vs_cf(plt, groups: Dict[str, pd.DataFrame], title: str, out_png: Path, add_fit=True):
+    plt.figure(figsize=(8.5, 6))
+    for name, d in groups.items():
+        dd = d.dropna(subset=["annual_mwh", "capacity_factor"]).copy()
+        if dd.empty:
+            continue
+        plt.scatter(dd["annual_mwh"], dd["capacity_factor"], label=name, alpha=0.8)
+        if add_fit and len(dd) >= 3:
+            x = dd["annual_mwh"].values.astype(float)
+            y = dd["capacity_factor"].values.astype(float)
+            a, b = _ols_fit(x, y)
+            xs = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+            ys = a * xs + b
+            plt.plot(xs, ys, linestyle="--", linewidth=1)
+
+    plt.xlabel("Annual MWh")
+    plt.ylabel("Capacity Factor (fração)")
+    plt.legend()
+    _savefig(plt, out_png)
+
+
+def plot_box_by_decade(plt, df: pd.DataFrame, value_col: str, title: str, out_png: Path):
+    d = df.dropna(subset=["ano", value_col]).copy()
+    if d.empty:
+        return
+    d["decada"] = d["ano"].astype(int).apply(_decade_of)
+    order = sorted(d["decada"].unique(), key=lambda s: int(s[:-1]))
+    data = [d.loc[d["decada"] == dec, value_col].astype(float).values for dec in order]
+
+    plt.figure(figsize=(10, 5))
+    bp = plt.boxplot(data, labels=order, showmeans=True, patch_artist=True)
+    # pinta boxes em tons frios
+    for i, box in enumerate(bp["boxes"]):
+        box.set_facecolor(BLUE_CYCLE[min(i, len(BLUE_CYCLE) - 1)])
+        box.set_alpha(0.35)
+    plt.xlabel("Década")
+    plt.ylabel(value_col)
+    _savefig(plt, out_png)
+
+
+def plot_box_by_scenario(plt, df_all: pd.DataFrame, value_col: str, title: str, out_png: Path):
+    d = df_all.dropna(subset=["scenario_comp", value_col]).copy()
+    if d.empty:
+        return
+    order = [s for s in ["historical", "ssp245", "ssp585"] if s in d["scenario_comp"].unique()]
+    data = [d.loc[d["scenario_comp"] == s, value_col].astype(float).values for s in order]
+    plt.figure(figsize=(8, 5))
+    bp = plt.boxplot(data, labels=order, showmeans=True, patch_artist=True)
+    for i, box in enumerate(bp["boxes"]):
+        box.set_facecolor(BLUE_CYCLE[min(i + 1, len(BLUE_CYCLE) - 1)])
+        box.set_alpha(0.35)
+    plt.ylabel(value_col)
+    _savefig(plt, out_png)
+
+
+def plot_anomaly_series(plt, df: pd.DataFrame, baseline_mwh: float, title: str, out_png: Path):
+    d = df.dropna(subset=["ano", "annual_mwh"]).copy()
+    if d.empty:
+        return
+    d["anom_pct"] = d["annual_mwh"].apply(lambda v: _safe_pct(float(v), float(baseline_mwh)))
+    plt.figure(figsize=(12, 5))
+    plt.plot(d["ano"], d["anom_pct"], marker="o", linewidth=1)
+    plt.axhline(0, linewidth=1)
+    plt.xlabel("Ano")
+    plt.ylabel("Anomalia de Annual MWh (%)")
+    _savefig(plt, out_png)
+
+
+def plot_compare_common_years(plt, df245: pd.DataFrame, df585: pd.DataFrame, ycol: str, title: str, out_png: Path):
+    a = df245[["ano", ycol]].dropna().copy()
+    b = df585[["ano", ycol]].dropna().copy()
+    common = sorted(set(a["ano"]).intersection(set(b["ano"])))
+    if not common:
+        return
+    a = a[a["ano"].isin(common)].sort_values("ano")
+    b = b[b["ano"].isin(common)].sort_values("ano")
+    plt.figure(figsize=(12, 5))
+    plt.plot(a["ano"], a[ycol], marker="o", linewidth=1, label="ssp245")
+    plt.plot(b["ano"], b[ycol], marker="o", linewidth=1, label="ssp585")
+    plt.xlabel("Ano (comum)")
+    plt.ylabel(ycol)
+    plt.legend()
+    _savefig(plt, out_png)
+
+
+def plot_pettitt(plt, df: pd.DataFrame, title: str, out_png: Path):
+    d = df.dropna(subset=["ano", "annual_mwh"]).sort_values("ano").copy()
+    if len(d) < 5:
+        return
+    test = pettitt_test(d["annual_mwh"])
+    k = test["k"]
+    if not np.isfinite(k):
+        return
+    k = int(k)
+    year_cp = int(d["ano"].iloc[k])
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(d["ano"], d["annual_mwh"], marker="o", linewidth=1, label="Annual MWh")
+    plt.axvline(year_cp, linestyle="--", linewidth=2, label=f"Pettitt: {year_cp} (p={test['p']:.3g})")
+    plt.xlabel("Ano")
+    plt.ylabel("MWh")
+    plt.legend()
+    _savefig(plt, out_png)
+
+
+def plot_heatmap_anom_monthly(plt, dfm_comp: pd.DataFrame, baseline_monthly: pd.Series, title: str, out_png: Path, cmap=None):
+    if dfm_comp.empty or baseline_monthly is None or baseline_monthly.empty:
+        return
+
+    pv = dfm_comp.pivot_table(index="ano", columns="mes", values="ac_kwh", aggfunc="mean").sort_index()
+    if pv.empty:
+        return
+
+    base = baseline_monthly.reindex(range(1, 13)).astype(float)
+    anom = pv.copy()
+    for m in range(1, 13):
+        anom[m] = anom[m].apply(lambda v: _safe_pct(float(v), float(base.loc[m])) if np.isfinite(v) else np.nan)
+
+    mat = anom.values.astype(float)
+    years = anom.index.values.astype(int)
+
+    plt.figure(figsize=(12, 6))
+    im = plt.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap)
+    plt.colorbar(im, label="Anomalia mensal (%) vs baseline mensal")
+    plt.xlabel("Mês")
+    plt.ylabel("Ano")
+    plt.xticks(ticks=np.arange(12), labels=[str(i) for i in range(1, 13)])
+    if len(years) > 25:
+        step = max(1, len(years) // 12)
+        yt = np.arange(0, len(years), step)
+        plt.yticks(ticks=yt, labels=[str(years[i]) for i in yt])
+    else:
+        plt.yticks(ticks=np.arange(len(years)), labels=[str(y) for y in years])
+    _savefig(plt, out_png)
+
+
+# ------------------------------ Relatório ------------------------------
+def _trend_summary(df: pd.DataFrame, col: str) -> Tuple[float, float, int]:
+    d = df.dropna(subset=["ano", col]).copy()
+    if len(d) < 3:
+        return float("nan"), float("nan"), int(len(d))
+    x = d["ano"].astype(float).values
+    y = d[col].astype(float).values
+    a, b = _ols_fit(x, y)
+    return float(a), float(b), int(len(d))
+
+
+def write_report(path: Path, lines: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ------------------------------ MAIN -----------------------------------
+def main():
+    print("MORPHED_CSV_ROOT:", MORPHED_CSV_ROOT)
+    print("LOG_DIR:", LOG_DIR)
+    print("OUT_DIR:", OUT_DIR)
+
+    idx = discover_morphed_csvs(MORPHED_CSV_ROOT)
+    if idx.empty:
+        raise RuntimeError(f"Não encontrei CSVs morfados em: {MORPHED_CSV_ROOT}")
+
+    print(f"Encontrados {len(idx)} CSVs morfados.")
+    for ssp in SCENARIOS:
+        sub = idx[idx["ssp"] == ssp]
+        if sub.empty:
+            print(f" - {ssp}: (vazio)")
+        else:
+            print(f" - {ssp}: {int(sub['ano'].min())}–{int(sub['ano'].max())} | n={len(sub)}")
+
+    # Reconstrói série anual a partir de logs e/ou rodando PySAM nos morfados
+    df_year, df_month = build_results_from_existing(idx)
+
+    if df_year.empty:
+        raise RuntimeError("Não consegui gerar/ler nenhum resultado anual (annual_mwh/capacity_factor).")
+
+    # salva auditoria da série reconstruída
+    out_results = TABLE_DIR / f"resultado_sam_reconstruido_{MODEL}.csv"
+    _save_csv(df_year, out_results)
+    print("Série anual reconstruída ->", out_results)
+
+    if not df_month.empty:
+        out_month = TABLE_DIR / f"mensal_ac_kwh_reconstruido_{MODEL}.csv"
+        _save_csv(df_month, out_month)
+        print("Série mensal (logs/PySAM) ->", out_month)
+
+    # Séries compostas
+    comp = {s: build_composed(df_year, s) for s in SCENARIOS}
+
+    # Baseline anual
+    df_base, base_desc = choose_baseline_annual(df_year, BASELINE_YEARS)
+    baseline_mwh = float(df_base["annual_mwh"].mean()) if not df_base.empty else float("nan")
+    baseline_cf = float(df_base["capacity_factor"].mean()) if not df_base.empty else float("nan")
+    print("Baseline anual usado:", base_desc)
+    print(f"Baseline: MWh={baseline_mwh:.3f} | CF={baseline_cf:.4f}")
+
+    # Tabela 16
+    t16 = table16_descriptive(comp)
+    t16_path = TABLE_DIR / "Tabela_16_estatisticas_descritivas.csv"
+    _save_csv(t16, t16_path)
+    print("Tabela 16 ->", t16_path)
+
+    # Baseline mensal (para heatmaps)
+    baseline_monthly = None
+    baseline_monthly_desc = "SEM_MENSAL"
+    if not df_month.empty:
+        baseline_monthly, baseline_monthly_desc = choose_baseline_monthly(df_month, BASELINE_YEARS)
+        if baseline_monthly is not None and not baseline_monthly.empty:
+            print("Baseline mensal usado:", baseline_monthly_desc)
+        else:
+            baseline_monthly = None
+
+    plt = _try_import_matplotlib()
+    cmap = _apply_plot_style(plt)
+
+    # anos comuns SSP245 vs SSP585
+    g245 = comp["ssp245"][comp["ssp245"]["ano"] >= FUTURE_START_YEAR].copy()
+    g585 = comp["ssp585"][comp["ssp585"]["ano"] >= FUTURE_START_YEAR].copy()
+    common_years = sorted(set(g245["ano"]).intersection(set(g585["ano"])))
+
+    # ===================== GRÁFICOS =====================
+
+    plot_time_series_mwh(
+        plt,
+        comp["historical"][comp["historical"]["ano"].between(1994, 2014)],
+        "IGNORADO",
+        FIG_DIR / "Grafico_27_historico_mwh_1994_2014.png",
+        add_roll=False,
+        add_trend=False,
+    )
+
+    plot_time_series_mwh(
+        plt,
+        comp["ssp245"],
+        "IGNORADO",
+        FIG_DIR / "Grafico_28_tendencia_mwh_ssp245_composta.png",
+        add_roll=False,
+        add_trend=True,
+    )
+
+    plot_time_series_mwh(
+        plt,
+        comp["ssp585"],
+        "IGNORADO",
+        FIG_DIR / "Grafico_29_tendencia_mwh_ssp585_composta.png",
+        add_roll=False,
+        add_trend=True,
+    )
+
+    plot_time_series_mwh(
+        plt,
+        comp["historical"][comp["historical"]["ano"].between(1994, 2014)],
+        "IGNORADO",
+        FIG_DIR / "Grafico_30_historico_mwh_rolling.png",
+        add_roll=True,
+        add_trend=False,
+    )
+
+    plot_time_series_mwh(
+        plt,
+        comp["ssp245"][comp["ssp245"]["ano"] >= FUTURE_START_YEAR],
+        "IGNORADO",
+        FIG_DIR / "Grafico_31_ssp245_mwh_rolling.png",
+        add_roll=True,
+        add_trend=False,
+    )
+
+    plot_time_series_mwh(
+        plt,
+        comp["ssp585"][comp["ssp585"]["ano"] >= FUTURE_START_YEAR],
+        "IGNORADO",
+        FIG_DIR / "Grafico_32_ssp585_mwh_rolling.png",
+        add_roll=True,
+        add_trend=False,
+    )
+
+    plot_compare_common_years(
+        plt,
+        comp["ssp245"][comp["ssp245"]["ano"] >= FUTURE_START_YEAR],
+        comp["ssp585"][comp["ssp585"]["ano"] >= FUTURE_START_YEAR],
+        "capacity_factor",
+        "IGNORADO",
+        FIG_DIR / "Grafico_24_cf_comparativo_anos_comuns_ssp245_ssp585.png",
+    )
+
+    # 24b com baseline
+    try:
+        a = comp["ssp245"][comp["ssp245"]["ano"] >= FUTURE_START_YEAR][["ano", "capacity_factor"]].dropna()
+        b = comp["ssp585"][comp["ssp585"]["ano"] >= FUTURE_START_YEAR][["ano", "capacity_factor"]].dropna()
+        common = sorted(set(a["ano"]).intersection(set(b["ano"])))
+        if common and np.isfinite(baseline_cf):
+            a = a[a["ano"].isin(common)].sort_values("ano")
+            b = b[b["ano"].isin(common)].sort_values("ano")
+            plt.figure(figsize=(12, 5))
+            plt.plot(a["ano"], a["capacity_factor"], marker="o", linewidth=1, label="ssp245")
+            plt.plot(b["ano"], b["capacity_factor"], marker="o", linewidth=1, label="ssp585")
+            plt.axhline(baseline_cf, linestyle="--", linewidth=2, label=f"baseline CF ({base_desc})")
+            plt.xlabel("Ano (comum)")
+            plt.ylabel("CF")
+            plt.legend()
+            _savefig(plt, FIG_DIR / "Grafico_24b_cf_anos_comuns_com_baseline.png")
+    except Exception:
+        pass
+
+    plot_scatter_mwh_vs_cf(
+        plt,
+        {"historical": comp["historical"], "ssp245": comp["ssp245"], "ssp585": comp["ssp585"]},
+        "IGNORADO",
+        FIG_DIR / "Grafico_25_scatter_mwh_vs_cf_todos.png",
+        add_fit=True,
+    )
+
+    if common_years:
+        g245c = g245[g245["ano"].isin(common_years)].copy()
+        g585c = g585[g585["ano"].isin(common_years)].copy()
+        plot_scatter_mwh_vs_cf(
+            plt,
+            {"ssp245 (anos comuns)": g245c, "ssp585 (anos comuns)": g585c},
+            "IGNORADO",
+            FIG_DIR / "Grafico_26_scatter_mwh_vs_cf_anos_comuns.png",
+            add_fit=True,
+        )
+    else:
+        g245c = pd.DataFrame()
+        g585c = pd.DataFrame()
+
+    plot_pettitt(
+        plt,
+        comp["historical"][comp["historical"]["ano"].between(1994, 2014)],
+        "IGNORADO",
+        FIG_DIR / "Grafico_33_pettitt_historical.png",
+    )
+    plot_pettitt(
+        plt,
+        comp["ssp245"],
+        "IGNORADO",
+        FIG_DIR / "Grafico_34_pettitt_ssp245_composta.png",
+    )
+    plot_pettitt(
+        plt,
+        comp["ssp585"],
+        "IGNORADO",
+        FIG_DIR / "Grafico_35_pettitt_ssp585_composta.png",
+    )
+
+    # Heatmaps (se tiver mensal)
+    if baseline_monthly is not None and not df_month.empty:
+        for scen, num in [("historical", 36), ("ssp245", 37), ("ssp585", 38)]:
+            if scen == "historical":
+                dm = df_month[df_month["ssp"] == "historical"].copy()
+            else:
+                dm = pd.concat(
+                    [
+                        df_month[(df_month["ssp"] == "historical") & (df_month["ano"] < FUTURE_START_YEAR)],
+                        df_month[(df_month["ssp"] == scen) & (df_month["ano"] >= FUTURE_START_YEAR)],
+                    ],
+                    ignore_index=True,
+                )
+            plot_heatmap_anom_monthly(
+                plt,
+                dm,
+                baseline_monthly=baseline_monthly,
+                title="IGNORADO",
+                out_png=FIG_DIR / f"Grafico_{num}_heatmap_anomalia_mensal_{scen}.png",
+                cmap=cmap,
+            )
+
+    plot_anomaly_series(
+        plt,
+        comp["historical"][comp["historical"]["ano"].between(1994, 2014)],
+        baseline_mwh,
+        "IGNORADO",
+        FIG_DIR / "Grafico_39_anomalia_anual_historical.png",
+    )
+    plot_anomaly_series(
+        plt,
+        comp["ssp245"],
+        baseline_mwh,
+        "IGNORADO",
+        FIG_DIR / "Grafico_39b_anomalia_anual_ssp245.png",
+    )
+    plot_anomaly_series(
+        plt,
+        comp["ssp585"],
+        baseline_mwh,
+        "IGNORADO",
+        FIG_DIR / "Grafico_39c_anomalia_anual_ssp585.png",
+    )
+
+    if common_years and not g245c.empty and not g585c.empty and np.isfinite(baseline_mwh):
+        g245c["anom_pct"] = g245c["annual_mwh"].apply(lambda v: _safe_pct(float(v), baseline_mwh))
+        g585c["anom_pct"] = g585c["annual_mwh"].apply(lambda v: _safe_pct(float(v), baseline_mwh))
+        plt.figure(figsize=(12, 5))
+        plt.plot(g245c["ano"], g245c["anom_pct"], marker="o", linewidth=1, label="ssp245")
+        plt.plot(g585c["ano"], g585c["anom_pct"], marker="o", linewidth=1, label="ssp585")
+        plt.axhline(0, linewidth=1)
+        plt.xlabel("Ano (comum)")
+        plt.ylabel("Anomalia (%)")
+        plt.legend()
+        _savefig(plt, FIG_DIR / "Grafico_40_anomalia_anos_comuns_ssp245_ssp585.png")
+
+    plot_box_by_decade(
+        plt,
+        comp["historical"][comp["historical"]["ano"].between(1994, 2014)],
+        "annual_mwh",
+        "IGNORADO",
+        FIG_DIR / "Grafico_41_box_mwh_por_decada_historical.png",
+    )
+    plot_box_by_decade(
+        plt,
+        comp["ssp245"],
+        "annual_mwh",
+        "IGNORADO",
+        FIG_DIR / "Grafico_42_box_mwh_por_decada_ssp245.png",
+    )
+    plot_box_by_decade(
+        plt,
+        comp["ssp585"],
+        "annual_mwh",
+        "IGNORADO",
+        FIG_DIR / "Grafico_43_box_mwh_por_decada_ssp585.png",
+    )
+
+    df_all2 = pd.concat([comp["historical"], comp["ssp245"], comp["ssp585"]], ignore_index=True)
+    plot_box_by_scenario(
+        plt,
+        df_all2,
+        "annual_mwh",
+        "IGNORADO",
+        FIG_DIR / "Grafico_44_box_mwh_por_cenario.png",
+    )
+
+    # Gráfico 45 – comparação
+    plt.figure(figsize=(12, 5))
+    h = comp["historical"][comp["historical"]["ano"].between(1994, 2014)].sort_values("ano")
+    s245 = comp["ssp245"][comp["ssp245"]["ano"] >= FUTURE_START_YEAR].sort_values("ano")
+    s585 = comp["ssp585"][comp["ssp585"]["ano"] >= FUTURE_START_YEAR].sort_values("ano")
+    if not h.empty:
+        plt.plot(h["ano"], h["annual_mwh"], marker="o", linewidth=1, label="historical (1994–2014)")
+    if not s245.empty:
+        plt.plot(s245["ano"], s245["annual_mwh"], marker="o", linewidth=1, label="ssp245 (anos disponíveis)")
+    if not s585.empty:
+        plt.plot(s585["ano"], s585["annual_mwh"], marker="o", linewidth=1, label="ssp585 (anos disponíveis)")
+    plt.xlabel("Ano")
+    plt.ylabel("MWh")
+    plt.legend()
+    _savefig(plt, FIG_DIR / "Grafico_45_comparacao_cenarios_mwh.png")
+
+    plot_compare_common_years(
+        plt,
+        comp["ssp245"][comp["ssp245"]["ano"] >= FUTURE_START_YEAR],
+        comp["ssp585"][comp["ssp585"]["ano"] >= FUTURE_START_YEAR],
+        "capacity_factor",
+        "IGNORADO",
+        FIG_DIR / "Grafico_46_cf_anos_comuns_ssp245_ssp585.png",
+    )
+
+    if common_years and not g245c.empty and not g585c.empty:
+        common_df = pd.DataFrame(
+            {
+                "ano": common_years,
+                "mwh_ssp245": g245c.set_index("ano").loc[common_years, "annual_mwh"].values,
+                "mwh_ssp585": g585c.set_index("ano").loc[common_years, "annual_mwh"].values,
+                "cf_ssp245": g245c.set_index("ano").loc[common_years, "capacity_factor"].values,
+                "cf_ssp585": g585c.set_index("ano").loc[common_years, "capacity_factor"].values,
+            }
+        )
+        _save_csv(common_df, TABLE_DIR / "anos_comuns_ssp245_ssp585.csv")
+
+    # ===================== RELATÓRIO =====================
+    lines = []
+    lines.append("RELATÓRIO GERAL – PARTE FOTOVOLTAICA (script gerar_figuras_fv_completas.py)")
+    lines.append("=" * 78)
+    lines.append("")
+    lines.append(f"MODELO: {MODEL}")
+    lines.append(f"MORPHED_CSV_ROOT: {MORPHED_CSV_ROOT}")
+    lines.append(f"LOG_DIR: {LOG_DIR}")
+    lines.append(f"OUT_DIR: {OUT_DIR}")
+    lines.append("")
+
+    # cobertura dos CSVs morfados
+    lines.append("1) COBERTURA DE ARQUIVOS (CSVs morfados encontrados)")
+    for ssp in SCENARIOS:
+        sub = idx[idx["ssp"] == ssp]
+        if sub.empty:
+            lines.append(f" - {ssp}: vazio")
+        else:
+            lines.append(f" - {ssp}: {int(sub['ano'].min())}–{int(sub['ano'].max())} | n={len(sub)}")
+    lines.append("")
+
+    # cobertura dos resultados anuais
+    lines.append("2) SÉRIE ANUAL RECONSTRUÍDA (annual_mwh / capacity_factor)")
+    for ssp in SCENARIOS:
+        sub = df_year[df_year["ssp"] == ssp]
+        if sub.empty:
+            lines.append(f" - {ssp}: vazio")
+        else:
+            lines.append(f" - {ssp}: {int(sub['ano'].min())}–{int(sub['ano'].max())} | n={len(sub)}")
+            src_counts = sub["fonte"].value_counts(dropna=False).to_dict()
+            lines.append(f"   fontes: {src_counts}")
+    lines.append("")
+
+    lines.append("3) BASELINE")
+    lines.append(f" - Anual: {base_desc}")
+    lines.append(f" - baseline_mwh = {baseline_mwh:.3f}")
+    lines.append(f" - baseline_cf  = {baseline_cf:.4f}")
+    lines.append("")
+    if baseline_monthly is not None and not baseline_monthly.empty:
+        lines.append(" - Mensal: " + baseline_monthly_desc)
+    else:
+        lines.append(" - Mensal: SEM_MENSAL (sem logs/saída mensal disponível)")
+    lines.append("")
+
+    # estatística descritiva (Tabela 16)
+    lines.append("4) TABELA 16 – Estatísticas descritivas (salva em CSV)")
+    lines.append(f" - arquivo: {t16_path}")
+    lines.append("")
+
+    # tendências
+    lines.append("5) TENDÊNCIAS (OLS)")
+    for scen in SCENARIOS:
+        a_mwh, b_mwh, n_mwh = _trend_summary(comp[scen], "annual_mwh")
+        a_cf, b_cf, n_cf = _trend_summary(comp[scen], "capacity_factor")
+        lines.append(f" - {scen}:")
+        lines.append(f"   annual_mwh: slope={a_mwh:.4g} MWh/ano | n={n_mwh}")
+        lines.append(f"   cap_factor: slope={a_cf:.4g} 1/ano  | n={n_cf}")
+    lines.append("")
+
+    # Pettitt
+    lines.append("6) PONTOS DE MUDANÇA (Pettitt em annual_mwh)")
+    for scen, dfp in [
+        ("historical_1994_2014", comp["historical"][comp["historical"]["ano"].between(1994, 2014)]),
+        ("ssp245_composta", comp["ssp245"]),
+        ("ssp585_composta", comp["ssp585"]),
+    ]:
+        d = dfp.dropna(subset=["ano", "annual_mwh"]).sort_values("ano")
+        if len(d) < 5:
+            lines.append(f" - {scen}: série insuficiente (n<5)")
+            continue
+        t = pettitt_test(d["annual_mwh"])
+        k = t["k"]
+        if not np.isfinite(k):
+            lines.append(f" - {scen}: teste falhou/insuficiente")
+            continue
+        year_cp = int(d["ano"].iloc[int(k)])
+        lines.append(f" - {scen}: ano_cp={year_cp} | p={t['p']:.3g} | K={t['K']:.3g}")
+    lines.append("")
+
+    # comparação ssp245 vs ssp585 anos comuns
+    lines.append("7) SSP245 vs SSP585 (anos comuns disponíveis)")
+    if common_years and not g245c.empty and not g585c.empty:
+        lines.append(f" - anos comuns: {min(common_years)}–{max(common_years)} | n={len(common_years)}")
+        m245 = float(g245c["annual_mwh"].mean())
+        m585 = float(g585c["annual_mwh"].mean())
+        cf245 = float(g245c["capacity_factor"].mean())
+        cf585 = float(g585c["capacity_factor"].mean())
+        lines.append(f" - média annual_mwh: ssp245={m245:.3f} | ssp585={m585:.3f} | diff(585-245)={m585-m245:.3f}")
+        lines.append(f" - média CF:        ssp245={cf245:.4f} | ssp585={cf585:.4f} | diff(585-245)={cf585-cf245:.4f}")
+    else:
+        lines.append(" - não há interseção de anos (ou dados insuficientes).")
+    lines.append("")
+
+    lines.append("8) SAÍDAS GERADAS")
+    lines.append(f" - Tabelas: {TABLE_DIR}")
+    lines.append(f" - Figuras: {FIG_DIR}")
+    lines.append("")
+    lines.append("Obs:")
+    lines.append(" - Todas as figuras foram salvas SEM títulos (pedido).")
+    lines.append(" - Paleta fria aplicada via ciclo de cores e colormap do heatmap.")
+    lines.append(" - O script usa apenas CSVs em MORPHED_CSV_ROOT e (se existirem) logs em LOG_DIR.")
+    lines.append("")
+
+    report_path = TABLE_DIR / "Relatorio_geral_FV.txt"
+    write_report(report_path, lines)
+    print("Relatório geral ->", report_path)
+
+    print("\n[OK] Saídas:")
+    print(" - Tabelas:", TABLE_DIR)
+    print(" - Figuras:", FIG_DIR)
+
+
+if __name__ == "__main__":
+    main()
