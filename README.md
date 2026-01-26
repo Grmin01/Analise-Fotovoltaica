@@ -1,292 +1,244 @@
-# Analise-Fotovoltaica
+# Analise-Fotovoltaica (SAM + Morph + QA + Figuras)
 
-Pipeline completo para avaliar impactos climáticos na **geração fotovoltaica** usando **ERA5-Land** (reanálise), **NEX-GDDP–CMIP6** (projeções), e **PVWatts v8 (PySAM)**.  
-Abrange _download_ de dados, pré-processamento, “morph” climático mensal, simulação horária no PVWatts e análises (tendência, anomalia, médias decadais).
+Pipeline completo para avaliar impactos climáticos na **geração fotovoltaica** usando:
 
-> **Alvo do estudo**: Campos dos Goytacazes (RJ, Brasil), ~(-21.7, -41.3)  
-> **Janela temporal**: 1994–2054 (histórico e cenários **ssp245/ssp585**)
+- **ERA5-Land/ERA5** (perfil horário base)
+- **NEX-GDDP–CMIP6** (projeções: `historical`, **ssp245**, **ssp585**)
+- **PVWatts v8 (PySAM)** para simular geração anual/mensal
+
+Abrange **morph climático mensal**, geração de **CSVs 8760h**, execução do **PVWatts**, **consolidação**, **análises** e **relatórios** (Markdown/TXT), além de um script de **QA mínimo defensável**.
+
+> **Alvo do estudo**: Campos dos Goytacazes (RJ, Brasil) — ~(-21.7, -41.3)  
+> **Janela temporal típica**: 1994–2054 (histórico + cenários **ssp245/ssp585**)  
+> **Modelo CMIP6 (exemplo atual)**: `ACCESS-CM2`
 
 ---
 
-## ⚙️ Principais componentes
+## 🧩 Principais componentes
 
-1. **`download_era5_uv_monthly_singlefile.py`**  
-   Baixa ERA5-Land (u10, v10) **um arquivo `.nc` por mês**, garantindo robustez (retries, _file lock_, descompactação automática) e limpeza de duplicação.
+1. **`pipeline_sam_unificado_v4_report.py`**  
+   Pipeline “tudo em um”:
+   - Pré-check (ERA5 base, amostra NEX, PySAM)
+   - Climatologia histórica (1994–2014) com **cache**
+   - Morph mensal (delta-change) do ano-base
+   - Validação do CSV morfado (8760, NaN, estatísticas)
+   - Execução do PVWatts (PySAM)
+   - Consolidação de logs (`OK/ERRO/SEM_LOG`)
+   - Análise (tendências, anomalias, tabelas e gráficos)
+   - **Relatório final (Markdown)** no `OUT_ROOT`
 
-2. **`gera_csvs_sam_number0.py`**  
-   Converte os `.nc` baixados em **CSVs horários** para o SAM/PySAM (colunas `DateTime, WindSpeed`) usando o **membro principal** (number==0) e index horário completo (8760/8784).
+2. **`qa_validacao_minima_morph.py`**  
+   Validação mínima “defensável” para os CSVs morfados:
+   - Sanidade interna (8760, NaN, passo 1h)
+   - Checagem `GHI ≈ DNI + DHI` (MAE/MAPE)
+   - Faixas físicas e flags (picos, RH, vento, etc.)
+   - Sazonalidade mensal agregada + gráfico
+   - Comparação externa opcional com **NASA POWER**
 
-3. **`pipeline_morph_validate_sam.py`**  
-   Implementa o **morph mensal** (NEX vs. climatologias históricas) sobre um **perfil ERA5 base** (8760 linhas) para gerar **CSV horário por ano/cenário** com `GHI, DNI, DHI, TempC, WindSpeed, RelHum` e roda o **PVWatts v8 (PySAM)**.
-
-4. **`consolida_sam_morph.py`**  
-   Consolida **logs** e **CSVs** produzidos no morph/PVWatts numa única planilha (`resultado_sam_consolidado_morph.csv`).
-
-5. **`analisar_sam_results.py`**  
-   Produz **sumários**, **tendências lineares**, **anomalias vs. baseline (1994–2014)**, **médias decadais** e **gráficos** em `./analise_sam/`.
+3. **`gerar_figuras_fv_completas.py`** *(ajuste o nome do arquivo se necessário)*  
+   Gera **tabelas + figuras finais (dissertação)** a partir dos CSVs morfados e/ou logs:
+   - Reconstrói série anual (MWh/CF) via logs ou rodando PySAM se faltar
+   - Monta séries **compostas** (historical + futuro)
+   - Baseline (preferência: `historical 1994–2014`)
+   - Estatísticas descritivas (Tabela 16)
+   - Tendências OLS, Pettitt (ponto de mudança)
+   - Heatmaps mensais (anomalia vs baseline mensal)
+   - Boxplots por década/cenário, dispersões e comparativos
+   - Relatório `.txt` final
 
 ---
 
 ## 🧰 Dependências
 
-- Python 3.10+
-- `pandas`, `numpy`, `xarray`, `netCDF4`, `h5netcdf`, `scipy`
-- `matplotlib` (para gráficos)
-- `PySAM` (PVWatts v8)
-- `cdsapi` (ERA5-Land, via CDS)
-- `tqdm` (opcional, barra de progresso)
+### Recomendado
+- Python **3.10+**
+- `pandas`, `numpy`
+- `matplotlib`
+- `xarray`, `netCDF4`
+- `tqdm` (opcional)
+- `NREL-PySAM` (PVWatts v8)
+- `requests` (somente para NASA POWER no QA)
 
 Instalação sugerida:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
+# Windows:
+.venv\Scripts\activate
+# Linux/Mac:
+# source .venv/bin/activate
+
 pip install --upgrade pip
-pip install pandas numpy xarray netCDF4 h5netcdf scipy matplotlib cdsapi PySAM tqdm
-```
+pip install pandas numpy matplotlib xarray netCDF4 tqdm NREL-PySAM requests
+🗂️ Estrutura de pastas (sugerida)
+Os scripts usam caminhos configuráveis no topo. A estrutura abaixo é a lógica recomendada.
 
-**Autenticação ERA5 (CDS):** criar `~/.cdsapirc` com:
-```
-url: https://cds.climate.copernicus.eu/api
-key: <UID>:<API_KEY>
-```
-> Obtenha UID/API no site do Copernicus CDS (perfil do usuário).
-
----
-
-## 🗂️ Estrutura de pastas (sugerida)
-
-```
 Analise-Fotovoltaica/
-├── download_era5_uv_monthly_singlefile.py
-├── gera_csvs_sam_number0.py
-├── pipeline_morph_validate_sam.py
-├── consolida_sam_morph.py
-├── analisar_sam_results.py
-├── data/                      # (opcional) .nc originais e derivados
-├── outputs/                   # saídas consolidadas
-└── analise_sam/               # tabelas e figuras geradas pelo analisador
-```
+├── pipeline_sam_unificado_v4_report.py
+├── qa_validacao_minima_morph.py
+├── gerar_figuras_fv_completas.py
+├── dados/
+│   ├── ERA5_BASE/
+│   │   └── solar_resource_hourly_lat-21.700_lon-41.300.csv
+│   └── NEX_CMIP6/
+│       └── ACCESS-CM2/
+│           ├── historical/
+│           ├── ssp245/
+│           └── ssp585/
+└── resultados/
+    └── SAM_MORPH/
+        ├── SAM_CSV_MORPH/ACCESS-CM2/
+        │   ├── historical/
+        │   ├── ssp245/
+        │   └── ssp585/
+        ├── logs_sam_morph_ACCESS-CM2/
+        ├── analise_sam_ACCESS-CM2/
+        ├── clim_cache_ACCESS-CM2_lat-21.700_lon-41.300.json
+        ├── resultado_sam_ACCESS-CM2_morph.csv
+        ├── resultado_sam_consolidado_ACCESS-CM2_morph.csv
+        └── relatorio_pipeline_ACCESS-CM2_YYYYMMDD_HHMMSS.md
+⚙️ Configuração rápida (o que você precisa ajustar)
+No topo do pipeline_sam_unificado_v4_report.py:
 
-> Os scripts têm **caminhos configuráveis** no topo (variáveis `OUT_DIR`, `NEX_DIR_ROOT`, etc.). Ajuste para seu ambiente local.
+Coordenadas/local:
 
----
+LAT, LON, ELEV, TZ
 
-## 🔄 Fluxo do pipeline
+Modelo/cenários/anos:
 
-```text
-ERA5 (u10/v10)  ──►  .nc mensais  ──►  CSVs horários (WindSpeed)
-                                 \           │
-                                  \          ▼
-                                   \   ERA5 base (perfil 8760h)  +  NEX-GDDP (rsds,tas,sfcWind,hurs)
-                                    \                 │
-                                     \                ▼
-                                      └────► Morph mensal por ano/cenário ──► CSVs SAM por ano
-                                                              │
-                                                              ▼
-                                                      PVWatts v8 (PySAM)
-                                                              │
-                                                              ▼
-                                        Logs + resultados anuais (MWh, CF) por ano/cenário
-                                                              │
-                                                              ▼
-                                  Consolidação  ──►  Análises (anomalia, tendência, décadas, gráficos)
-```
+MODEL, SCENARIOS_DEFAULT, YEARS_DEFAULT
 
----
+Caminhos (principais):
 
-## 🚀 Passo a passo
+CSV_ERA5_BASE (CSV horário base com DateTime, GHI, DNI, DHI, TempC, WindSpeed, RelHum)
 
-### 1) Baixar ERA5-Land (u10/v10) — `download_era5_uv_monthly_singlefile.py`
+NEX_DIR_ROOT (raiz do NEX para o modelo)
 
-**O que faz**
-- Define **lat/lon** do alvo e cria um **bounding box** pequeno (`PAD = 0.25`).
-- Solicita ao **CDS** os dados `10m_u_component_of_wind` e `10m_v_component_of_wind`
-  para **todas as horas** do mês (formato **NetCDF**).
-- Garante robustez: _retry_ por mês, _wait for stable file_, remoção de duplicatas,
-  e **descompactação automática** de ZIP/GZIP.
-- Saída: `era5land_YYYY_MM.nc` em `OUT_DIR`.
+OUT_ROOT (onde tudo será gerado)
 
-**Funções-chave**
-- `_wait_file_stable(path)`: espera o arquivo estabilizar no disco (tamanho fixo).
-- `_unpack_if_needed(path)`: detecta e **descompacta** `zip`/`gz` para `.nc` limpo.
-- `_cleanup_previous_same_month(year, month)`: evita múltiplos arquivos do mesmo mês.
-- `retrieve_month(client, year, month)`: baixa **ambas variáveis juntas** e grava um `.nc` por mês.
-- `process_year(client, year)`: itera 12 meses com **retries**.
-- `main()`: instancia o `cdsapi.Client` e processa todos anos definidos.
+🔄 Fluxo do pipeline (visão)
+ERA5 base (8760h) + NEX (rsds,tas,sfcWind,hurs)
+              │
+              ▼
+ Climatologia histórica 1994–2014 (cache)
+              │
+              ▼
+ Morph mensal (delta change) → CSV morfado por ano/cenário (8760h)
+              │
+              ▼
+ PVWatts v8 (PySAM) → annual_mwh, capacity_factor, ac_monthly_kwh
+              │
+              ▼
+ Logs → Consolidação → Análise (tabelas, tendências, gráficos)
+              │
+              ▼
+ Relatório final (Markdown)
+🚀 Como rodar
+1) Rodar o pipeline (com relatório final)
+Teste curto (recomendado):
 
-**Como rodar**
+python pipeline_sam_unificado_v4_report.py --mode test
+Rodar completo:
 
-```bash
-python download_era5_uv_monthly_singlefile.py
-# Ajuste YEARS, OUT_DIR e a área se necessário.
-```
+python pipeline_sam_unificado_v4_report.py --mode full
+Rodar apenas alguns anos/cenário:
 
----
+python pipeline_sam_unificado_v4_report.py --mode full --years 2020:2025 --scenarios ssp245
+Forçar reprocessamento (ignora logs OK):
 
-### 2) Gerar CSVs horários para SAM — `gera_csvs_sam_number0.py`
+python pipeline_sam_unificado_v4_report.py --mode full --force
+Somente consolidar + analisar (não executa morph/SAM):
 
-**O que faz**
-- Varre `TMP_DIR` (ou `OUT_DIR` do passo 1) por arquivos `era5land_YYYY_MM*.nc`.
-- Abre com `xarray` (tentando `netcdf4` → `h5netcdf` → `scipy`).
-- Seleciona **membro 0** (`number==0`), renomeia `10m_u_component_of_wind`→`u10` e `v10`.
-- Seleciona **ponto mais próximo** de `LAT/LON`.
-- Calcula `WindSpeed = sqrt(u10^2 + v10^2)`.
-- Constrói índice horário **completo** de cada ano (8760/8784), detecta faltas e aborta se houver lacunas.
-- Saídas: `SAM_ERA5_HIST_YYYY.csv` com `DateTime,WindSpeed`.
+python pipeline_sam_unificado_v4_report.py --mode analyze
+✅ Saída importante:
 
-**Funções-chave**
-- `open_any(nc)`: abre `.nc` com **retries** alternando _engines_.
-- `normalize_dims(ds)`: padroniza nomes/dimensões e **remove** coords problemáticas.
-- `select_point(ds, lat, lon)`: busca o **grid mais próximo** (ajusta 0..360 se preciso).
-- `extract_datetime_and_values(wspd, target_year)`: **prioriza** `valid_time` (se existir) e garante **1 linha/hora**.
-- `expected_hourly_index(year)`: cria índice horário completo do ano.
+relatorio_pipeline_{MODEL}_YYYYMMDD_HHMMSS.md em OUT_ROOT
 
-**Como rodar**
+2) Rodar QA mínimo dos CSVs morfados
+python qa_validacao_minima_morph.py ^
+  --input-dir "C:\Users\alexs\clima_campos\resultados\SAM_MORPH\SAM_CSV_MORPH\ACCESS-CM2" ^
+  --out-dir   "C:\Users\alexs\clima_campos\resultados\SAM_MORPH\qa_ACCESS-CM2" ^
+  --lat -21.7 --lon -41.3
+Sem NASA POWER:
 
-```bash
-python gera_csvs_sam_number0.py
-# Ajuste TMP_DIR (onde os .nc foram baixados) e OUT_DIR (onde salvar CSVs).
-```
+python qa_validacao_minima_morph.py --input-dir "..." --out-dir "..." --external none
+3) Gerar tabelas e figuras finais (dissertação)
+python gerar_figuras_fv_completas.py
+Ele lê:
 
----
+CSVs morfados em MORPHED_CSV_ROOT
 
-### 3) Morph + validação + PVWatts — `pipeline_morph_validate_sam.py`
+Logs em LOG_DIR
+E, se faltar resultado, pode rodar PySAM diretamente nos CSVs (controlado por RUN_PYSAM_IF_MISSING).
 
-**O que faz**
-- Usa um **CSV ERA5 base** (um **único ano** completo, 8760h) com `GHI,DNI,DHI,TempC,WindSpeed,RelHum` como **perfil horário**.
-- Calcula **deltas/fatores mensais** usando **NEX-GDDP–CMIP6** e **climatologias históricas** (1994–2014).
-- Aplica morph **mês a mês** no perfil base para gerar **CSVs por ano e cenário**:
-  - `k_rsds = fut_rsds / clim_rsds` → escala **GHI**; **DNI/DHI** preservam a fração DNI/GHI original.
-  - `d_tas  = fut_tas  - clim_tas`  → desloca **TempC** (°C).
-  - `k_wspd = fut_wspd / clim_wspd` → escala **WindSpeed** (multiplicativo).
-  - `d_hurs = fut_hurs - clim_hurs`  → desloca **RelHum** (%) — _fallback_ 0% se ausente.
-- **Reindexa o ano** no `DateTime`, **remove 29/02** se existir e **valida 8760 linhas**.
-- Roda o **PVWatts v8** (PySAM) com parâmetros do sistema (capacidade, tilt, azimute, perdas, GCR, etc.).
-- Salva **CSVs por ano** e **logs** (JSON com `annual_mwh`, `capacity_factor`, etc.).
+📦 Saídas geradas (checklist)
+Script 1 — Pipeline (v4)
+SAM_CSV_MORPH/{MODEL}/{ssp}/SAM_{MODEL}_{ssp}_{ano}_morph.csv
 
-**Funções-chave (destaques)**
-- `read_era5_base(path)`: carrega o perfil base e **autoescala irradiância** (pico ~900 W/m²) se necessário.
-- `_load_nex_one_year_monthly(var, year, ssp)`: extrai **médias mensais** do NEX para o **ano-alvo** e **ponto**.
-- `_load_nex_hist_monthly(var)`: monta **climatologia mensal** 1994–2014 (NEX historical).
-- `_load_wind_clim_from_era5_csvs(csv_dir)`: climatologia de **vento** a partir dos seus **CSVs ERA5**.
-- `morph_one_year(ssp, year)`: aplica os deltas/fatores mensais ao perfil, reindexa o ano e grava CSV final.
-- `validate_sam_csv(path)`: checa campos, NaN e 8760 linhas.
-- `run_sam_from_csv(path)`: monta `SolarResource` e executa **PVWatts v8**, retornando `annual_mwh`, `capacity_factor` e `ac_monthly_kwh`.
+logs_sam_morph_{MODEL}/log_{ssp}_{ano}.txt
 
-**Configuração relevante (no topo do script)**
-- **Local/coords**: `LAT, LON, ELEV, TZ`
-- **Sistema FV**: `SYSTEM_CAP_KW, TILT_DEG, AZIMUTH_DEG, DC_AC_RATIO, LOSSES_PCT, INVERTER_EFF, MODULE_TYPE, ARRAY_TYPE, GCR`
-- **Cenários/anos**: `MODEL, SCENARIOS, YEARS, ERA5_BASE_YEAR`
-- **Caminhos**: `CSV_ERA5_BASE, NEX_DIR_ROOT, ERA5_HOURLY_DIR, PLANILHA_ERA5, OUT_SAM_CSV_DIR, LOG_DIR`
-- **Opções**: `IRRAD_SCALE=None` (auto), `USE_YEARLY_WIND=True` (recomendado), `PLOT_RESULTS=True`
+resultado_sam_{MODEL}_morph.csv
 
-**Como rodar**
+resultado_sam_consolidado_{MODEL}_morph.csv
 
-```bash
-python pipeline_morph_validate_sam.py
-# Gera CSVs por ano/cenário em OUT_SAM_CSV_DIR e logs/resultado CSV agregado (OUT_RESULTS_CSV).
-```
+analise_sam_{MODEL}/coverage.csv
 
----
+analise_sam_{MODEL}/trends.csv
 
-### 4) Consolidação — `consolida_sam_morph.py`
+analise_sam_{MODEL}/summary_by_year.csv
 
-**O que faz**
-- Percorre **logs** gerados no passo 3 e casa com os **CSVs morfados**.
-- Monta um **CSV consolidado** com: `modelo, ssp, ano, annual_mwh, capacity_factor, tempo_s, caminho_csv, log_status, log_msg`.
+analise_sam_{MODEL}/summary_decadal.csv
 
-**Funções-chave**
-- `parse_log_file(fp)`: tenta ler o **JSON** dos logs; se não for JSON, captura **"ERRO: ..."** no texto.
+analise_sam_{MODEL}/figs/*.png
 
-**Como rodar**
+relatorio_pipeline_{MODEL}_*.md
 
-```bash
-python consolida_sam_morph.py
-# Gera resultado_sam_consolidado_morph.csv
-```
+clim_cache_{MODEL}_*.json
 
----
+Script 2 — QA
+qa_interno_por_arquivo.csv
 
-### 5) Análises e gráficos — `analisar_sam_results.py`
+medias_mensais_por_arquivo.csv
 
-**O que faz**
-- Lê o CSV de resultados (do passo 3 ou do consolidado) e produz em `./analise_sam/`:
-  - `summary_by_year.csv`: série anual com baseline e deltas.
-  - `summary_decadal.csv`: médias por década/cenário.
-  - `trends.csv`: **inclinação linear por década** (%/década) e **R²** para MWh e CF.
-  - `coverage.csv`: cobertura (anos min/max, contagem).
-  - PNGs: séries, anomalias vs baseline, boxplots decadais e barras de comparação (ex.: 2015 vs 2050).
+medias_mensais_agregado.csv
 
-**Funções-chave**
-- `_safe_pct(a, b)`: delta percentual seguro.
-- `_linear_trend(years, values)`: inclinação linear (%/década) relativa ao valor médio + R².
-- `_rolling(series, win=5)`: média móvel (suave) para facilita visualizações.
-- `_try_import_matplotlib()`: lida com ausência do Matplotlib sem quebrar.
+fig_sazonalidade_mensal.png
 
-**Como rodar**
+relatorio_validacao_minima.md
 
-```bash
-python analisar_sam_results.py
-# Ajuste RESULTS_CSV se necessário; figuras e CSVs saem em ./analise_sam/
-```
+comparacao_nasa_power.csv (opcional)
 
----
+Script 3 — Figuras + Tabelas (dissertação)
+Em OUT_DIR:
 
-## 📑 Entradas & Saídas (resumo)
+TABELAS_FV/resultado_sam_reconstruido_{MODEL}.csv
 
-**Entradas**  
-- ERA5-Land: u10/v10 horários por mês (`.nc`).  
-- ERA5 CSVs horários (1994–2014) para **climatologia de vento**.  
-- NEX-GDDP–CMIP6: `rsds, tas, sfcWind, hurs` (arquivos diários por **ano** e **cenário**).  
-- Perfil base ERA5 (8760h) com `GHI, DNI, DHI, TempC, WindSpeed, RelHum`.
+TABELAS_FV/mensal_ac_kwh_reconstruido_{MODEL}.csv (se houver)
 
-**Saídas principais**  
-- `SAM_ERA5_HIST_YYYY.csv` (vento horário).  
-- `SAM_<MODEL>_{historical|ssp245|ssp585}_YYYY_morph.csv` (recurso solar-horário morfado).  
-- `resultado_sam_TEST_*.csv` (agregado com MWh/CF por ano/cenário).  
-- `resultado_sam_consolidado_morph.csv` (consolidação final).  
-- `analise_sam/*` (sumários e gráficos).
+TABELAS_FV/Tabela_16_estatisticas_descritivas.csv
 
----
+TABELAS_FV/Relatorio_geral_FV.txt
 
-## 🧪 Validações embutidas
+GRAFICOS_FV/*.png (gráficos numerados no script)
 
-- **Arquivo estável** pós-download, descompressão transparente de `zip/gz`.  
-- **8760 horas** por CSV (remove **29/02** quando necessário).  
-- Checagem de **NaN** e de **índice horário contínuo** (gera erro se faltar hora).  
-- **Autoescala** de irradiância do perfil base (pico ~900 W/m²) para evitar valores irreais.  
-- **Seleção de ponto mais próximo** (lon 0..360 compatível).
+🧾 Nota metodológica (para dissertação)
+A série horária é gerada por técnica de delta change mensal aplicada a um ano-base horário (ERA5).
+Assim, a forma intradiária do ano-base é preservada e os níveis mensais são ajustados conforme o modelo climático (NEX-CMIP6).
+Por isso, inferências de tendência são mais robustas em médias mensais/anuais do que em extremos horários.
 
----
+🧯 Problemas comuns
+ERA5 base não tem 8760 linhas
+O script remove 29/02 se vier 8784. Se ainda não for 8760, há buracos/duplicações no DateTime.
 
-## 🧯 Troubleshooting rápido
+NaN no ERA5 base / NaN após morph
+Verifique colunas e conversão numérica. O pipeline falha cedo para não “contaminar” resultados.
 
-- **Faltam horas no CSV ERA5**: verifique `.nc` de meses específicos e se `valid_time` está presente; o script aborta quando há lacunas.
-- **PySAM não encontrado**: confirme instalação (`pip install PySAM`) e versão do Python compatível.
-- **Arquivos NEX não localizados**: ajuste `NEX_DIR_ROOT` e padrão de nomes; o script tenta múltiplos padrões.
-- **HURS ausente**: o morph usa **delta 0%** como _fallback_.  
-- **Resultados “estranhos” de irradiância**: defina `IRRAD_SCALE` manualmente (ex.: `IRRAD_SCALE=23.5`) ou revise o CSV base.
+NEX não encontrado (FileNotFoundError)
+Confirme NEX_DIR_ROOT, MODEL e a presença de historical/ssp245/ssp585 com arquivos por ano.
 
----
+PySAM não importa
+Instale NREL-PySAM no mesmo .venv. Em Windows, cuidado com versão do Python e wheels disponíveis.
 
-## 🔐 Reprodutibilidade
-
-- Caminhos e versões **fixados** no início de cada script.
-- Names de saída **determinísticos** por ano/cenário.
-- Logs em texto/JSON por execução do PVWatts (tempo de execução, energia anual, CF).
-
----
-
-## 📜 Licença
-
-Sugerido: **MIT License** (adicione `LICENSE` conforme sua preferência institucional).
-
----
-
-## ✨ Agradecimentos
-
-- Copernicus Climate Data Store (ERA5-Land)  
-- NEX-GDDP–CMIP6 (NASA/LLNL)  
-- NREL SAM / PySAM (PVWatts v8)
-
+SEM_LOG no consolidado
+Existe CSV morfado mas não existe log correspondente (por execução interrompida, etc.).
+Rode --mode analyze para consolidar e checar, ou rode --force para gerar logs novamente.
