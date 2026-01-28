@@ -35,9 +35,12 @@ FUTURE_START_YEAR = 2015
 ROLL_WIN = 5
 DPI = 180
 
+# =================== NOVO: Bandas de média/desvio/anomalia ===================
+ADD_MEAN_STD_BANDS = True          # liga/desliga bandas em séries anuais (MWh/CF)
+STD_BAND_K = 1.0                   # 1.0 => ±1 DP, 2.0 => ±2 DP, etc.
+ADD_ANOMALY_MEAN_STD_BANDS = True  # liga/desliga bandas nos gráficos de anomalia (%)
+
 # Paleta fria (azul claro -> azul escuro quase preto)
-# - usada como ciclo de cores para linhas/markers
-# - e também para colormap do heatmap
 BLUE_CYCLE = ["#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c", "#08306b"]
 BLUE_CMAP_COLORS = ["#eaf2fb", "#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c", "#08306b", "#001021"]
 
@@ -124,6 +127,14 @@ def ensure_datetime(series: pd.Series) -> pd.Series:
     if s.isna().any():
         raise ValueError(f"Falha ao converter DateTime: {int(s.isna().sum())} linhas inválidas.")
     return s
+
+
+def _mean_std(v: np.ndarray) -> Tuple[float, float]:
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 2:
+        return float("nan"), float("nan")
+    return float(np.mean(v)), float(np.std(v, ddof=1))
 
 
 # ------------------------- Descoberta de arquivos ----------------------
@@ -482,39 +493,91 @@ def _savefig(plt, path: Path) -> None:
     plt.close()
 
 
-def plot_time_series_mwh(plt, df: pd.DataFrame, title: str, out_png: Path, add_roll=True, add_trend=True):
+def plot_time_series_mwh(
+    plt,
+    df: pd.DataFrame,
+    title: str,
+    out_png: Path,
+    add_roll=True,
+    add_trend=True,
+    add_mean_std_bands: bool = ADD_MEAN_STD_BANDS,
+    std_k: float = STD_BAND_K,
+):
     d = df.dropna(subset=["ano", "annual_mwh"]).copy()
     if d.empty:
         return
+
+    d = d.sort_values("ano")
     x = d["ano"].astype(int).values
     y = d["annual_mwh"].astype(float).values
+
     plt.figure(figsize=(12, 5))
     plt.plot(x, y, marker="o", linewidth=1, label="Annual MWh")
+
+    if add_mean_std_bands:
+        mu, sd = _mean_std(y)
+        if np.isfinite(mu) and np.isfinite(sd):
+            plt.axhline(mu, linestyle="--", linewidth=1, label=f"Média={mu:.2f} MWh")
+            plt.fill_between(
+                x,
+                mu - std_k * sd,
+                mu + std_k * sd,
+                alpha=0.15,
+                label=f"Faixa ±{std_k:g} DP ({sd:.2f} MWh)",
+            )
+
     if add_roll:
         rr = _rolling(pd.Series(y, index=x), win=ROLL_WIN)
         plt.plot(rr.index.values, rr.values, linestyle="--", linewidth=1, label=f"Média móvel {ROLL_WIN}a")
+
     if add_trend and len(x) >= 3:
         a, b = _ols_fit(x, y)
         yhat = a * x + b
         plt.plot(x, yhat, linestyle=":", linewidth=2, label="Tendência OLS")
+
     plt.xlabel("Ano")
     plt.ylabel("MWh")
     plt.legend()
     _savefig(plt, out_png)
 
 
-def plot_time_series_cf(plt, df: pd.DataFrame, title: str, out_png: Path, add_trend=True):
+def plot_time_series_cf(
+    plt,
+    df: pd.DataFrame,
+    title: str,
+    out_png: Path,
+    add_trend=True,
+    add_mean_std_bands: bool = ADD_MEAN_STD_BANDS,
+    std_k: float = STD_BAND_K,
+):
     d = df.dropna(subset=["ano", "capacity_factor"]).copy()
     if d.empty:
         return
+
+    d = d.sort_values("ano")
     x = d["ano"].astype(int).values
     y = d["capacity_factor"].astype(float).values
+
     plt.figure(figsize=(12, 5))
     plt.plot(x, y, marker="o", linewidth=1, label="CF (fração)")
+
+    if add_mean_std_bands:
+        mu, sd = _mean_std(y)
+        if np.isfinite(mu) and np.isfinite(sd):
+            plt.axhline(mu, linestyle="--", linewidth=1, label=f"Média={mu:.5f}")
+            plt.fill_between(
+                x,
+                mu - std_k * sd,
+                mu + std_k * sd,
+                alpha=0.15,
+                label=f"Faixa ±{std_k:g} DP ({sd:.5f})",
+            )
+
     if add_trend and len(x) >= 3:
         a, b = _ols_fit(x, y)
         yhat = a * x + b
         plt.plot(x, yhat, linestyle=":", linewidth=2, label="Tendência OLS")
+
     plt.xlabel("Ano")
     plt.ylabel("CF")
     plt.legend()
@@ -552,7 +615,6 @@ def plot_box_by_decade(plt, df: pd.DataFrame, value_col: str, title: str, out_pn
 
     plt.figure(figsize=(10, 5))
     bp = plt.boxplot(data, labels=order, showmeans=True, patch_artist=True)
-    # pinta boxes em tons frios
     for i, box in enumerate(bp["boxes"]):
         box.set_facecolor(BLUE_CYCLE[min(i, len(BLUE_CYCLE) - 1)])
         box.set_alpha(0.35)
@@ -576,16 +638,43 @@ def plot_box_by_scenario(plt, df_all: pd.DataFrame, value_col: str, title: str, 
     _savefig(plt, out_png)
 
 
-def plot_anomaly_series(plt, df: pd.DataFrame, baseline_mwh: float, title: str, out_png: Path):
+def plot_anomaly_series(
+    plt,
+    df: pd.DataFrame,
+    baseline_mwh: float,
+    title: str,
+    out_png: Path,
+    add_mean_std_bands: bool = ADD_ANOMALY_MEAN_STD_BANDS,
+    std_k: float = STD_BAND_K,
+):
     d = df.dropna(subset=["ano", "annual_mwh"]).copy()
     if d.empty:
         return
+    d = d.sort_values("ano")
     d["anom_pct"] = d["annual_mwh"].apply(lambda v: _safe_pct(float(v), float(baseline_mwh)))
+
+    x = d["ano"].astype(int).values
+    y = d["anom_pct"].astype(float).values
+
     plt.figure(figsize=(12, 5))
-    plt.plot(d["ano"], d["anom_pct"], marker="o", linewidth=1)
-    plt.axhline(0, linewidth=1)
+    plt.plot(x, y, marker="o", linewidth=1, label="Anomalia anual (%)")
+    plt.axhline(0, linewidth=1, label="Baseline (0%)")
+
+    if add_mean_std_bands:
+        mu, sd = _mean_std(y)
+        if np.isfinite(mu) and np.isfinite(sd):
+            plt.axhline(mu, linestyle="--", linewidth=1, label=f"Média anomalia={mu:.2f}%")
+            plt.fill_between(
+                x,
+                mu - std_k * sd,
+                mu + std_k * sd,
+                alpha=0.15,
+                label=f"Faixa ±{std_k:g} DP ({sd:.2f}%)",
+            )
+
     plt.xlabel("Ano")
     plt.ylabel("Anomalia de Annual MWh (%)")
+    plt.legend()
     _savefig(plt, out_png)
 
 
@@ -750,6 +839,7 @@ def main():
         FIG_DIR / "Grafico_27_historico_mwh_1994_2014.png",
         add_roll=False,
         add_trend=False,
+        add_mean_std_bands=True,   # NOVO: mostra média±DP no histórico
     )
 
     plot_time_series_mwh(
@@ -759,6 +849,7 @@ def main():
         FIG_DIR / "Grafico_28_tendencia_mwh_ssp245_composta.png",
         add_roll=False,
         add_trend=True,
+        add_mean_std_bands=True,   # NOVO
     )
 
     plot_time_series_mwh(
@@ -768,6 +859,7 @@ def main():
         FIG_DIR / "Grafico_29_tendencia_mwh_ssp585_composta.png",
         add_roll=False,
         add_trend=True,
+        add_mean_std_bands=True,   # NOVO
     )
 
     plot_time_series_mwh(
@@ -777,6 +869,7 @@ def main():
         FIG_DIR / "Grafico_30_historico_mwh_rolling.png",
         add_roll=True,
         add_trend=False,
+        add_mean_std_bands=True,   # NOVO
     )
 
     plot_time_series_mwh(
@@ -786,6 +879,7 @@ def main():
         FIG_DIR / "Grafico_31_ssp245_mwh_rolling.png",
         add_roll=True,
         add_trend=False,
+        add_mean_std_bands=True,   # NOVO
     )
 
     plot_time_series_mwh(
@@ -795,6 +889,7 @@ def main():
         FIG_DIR / "Grafico_32_ssp585_mwh_rolling.png",
         add_roll=True,
         add_trend=False,
+        add_mean_std_bands=True,   # NOVO
     )
 
     plot_compare_common_years(
@@ -888,12 +983,14 @@ def main():
                 cmap=cmap,
             )
 
+    # NOVO: anomalia anual com bandas média±DP (em %)
     plot_anomaly_series(
         plt,
         comp["historical"][comp["historical"]["ano"].between(1994, 2014)],
         baseline_mwh,
         "IGNORADO",
         FIG_DIR / "Grafico_39_anomalia_anual_historical.png",
+        add_mean_std_bands=True,
     )
     plot_anomaly_series(
         plt,
@@ -901,6 +998,7 @@ def main():
         baseline_mwh,
         "IGNORADO",
         FIG_DIR / "Grafico_39b_anomalia_anual_ssp245.png",
+        add_mean_std_bands=True,
     )
     plot_anomaly_series(
         plt,
@@ -908,6 +1006,7 @@ def main():
         baseline_mwh,
         "IGNORADO",
         FIG_DIR / "Grafico_39c_anomalia_anual_ssp585.png",
+        add_mean_std_bands=True,
     )
 
     if common_years and not g245c.empty and not g585c.empty and np.isfinite(baseline_mwh):
@@ -1000,6 +1099,8 @@ def main():
     lines.append(f"LOG_DIR: {LOG_DIR}")
     lines.append(f"OUT_DIR: {OUT_DIR}")
     lines.append("")
+    lines.append(f"Bandas: ADD_MEAN_STD_BANDS={ADD_MEAN_STD_BANDS} | STD_BAND_K={STD_BAND_K} | ADD_ANOMALY_MEAN_STD_BANDS={ADD_ANOMALY_MEAN_STD_BANDS}")
+    lines.append("")
 
     # cobertura dos CSVs morfados
     lines.append("1) COBERTURA DE ARQUIVOS (CSVs morfados encontrados)")
@@ -1088,9 +1189,9 @@ def main():
     lines.append(f" - Figuras: {FIG_DIR}")
     lines.append("")
     lines.append("Obs:")
-    lines.append(" - Todas as figuras foram salvas SEM títulos (pedido).")
+    lines.append(" - Figuras salvas sem títulos (pedido).")
     lines.append(" - Paleta fria aplicada via ciclo de cores e colormap do heatmap.")
-    lines.append(" - O script usa apenas CSVs em MORPHED_CSV_ROOT e (se existirem) logs em LOG_DIR.")
+    lines.append(" - Bandas sombreadas mostram média ± k*DP (k definido em STD_BAND_K).")
     lines.append("")
 
     report_path = TABLE_DIR / "Relatorio_geral_FV.txt"
